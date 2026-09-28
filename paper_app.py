@@ -18,8 +18,9 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from PIL import Image, ImageTk
 
-from paper_catalog import (CELL_ROLE_MODELS, available_channels,
-                           get_model, validate_assignment)
+from paper_catalog import (CELL_ROLE_MODELS, CHANNEL_LABELS,
+                           available_channels, channel_sources, compose_model,
+                           effective_model, get_model, validate_assignment)
 from paper_engine import save_result, simulate
 from paper_formulas import equations_for
 from paper_search import MAX_CONDITIONS, cpu_count, default_workers, group_total, run_search
@@ -112,6 +113,7 @@ class PaperApp(tk.Tk):
         self.preview = None
         self.groups = []
         self.points = {}
+        self.composition = None
         self.disabled_channels = set()
         self.channel_vars = {}
         self.selected_keys = set()
@@ -140,12 +142,14 @@ class PaperApp(tk.Tk):
         self.book = book
         self.params_tab = ttk.Frame(book, padding=12)
         self.channels_tab = ttk.Frame(book, padding=12)
+        self.builder_tab = ttk.Frame(book, padding=12)
         self.search_tab = ttk.Frame(book, padding=12)
         self.results_tab = ttk.Frame(book, padding=12)
         self.formulas_tab = ttk.Frame(book, padding=12)
         self.sources_tab = ttk.Frame(book, padding=12)
         for tab, title in ((self.params_tab, "Values and bounds"),
                            (self.channels_tab, "Channels"),
+                           (self.builder_tab, "Build model"),
                            (self.search_tab, "Combinations and run"),
                            (self.results_tab, "Results and traces"),
                            (self.formulas_tab, "Equations"),
@@ -153,6 +157,7 @@ class PaperApp(tk.Tk):
             book.add(tab, text=title)
         self._build_params()
         self._build_channels()
+        self._build_builder()
         self._build_search()
         self._build_results()
         self._build_formulas()
@@ -212,11 +217,138 @@ class PaperApp(tk.Tk):
         ttk.Button(tab, text="Turn all channels on", command=self.enable_all_channels).pack(
             anchor="w", pady=18)
 
+    def _build_builder(self):
+        tab = self.builder_tab
+        ttk.Label(tab, text="Combine published channel modules into a custom single-cell model.",
+                  font=("Helvetica", 12, "bold")).pack(anchor="w", pady=(0, 7))
+        ttk.Label(tab, text="Select a channel, choose its source model, then add it. "
+                  "The hybrid current sum is an exploratory construction, not a published model.",
+                  foreground="#526070").pack(anchor="w", pady=(0, 9))
+        frame = ttk.Frame(tab)
+        frame.pack(fill="both", expand=True)
+        self.builder_tree = ttk.Treeview(frame, columns=("key", "channel", "included", "source"),
+                                         show="headings", selectmode="browse", height=15)
+        for key, label, width in (("key", "Parameter", 120), ("channel", "Channel", 220),
+                                  ("included", "Included", 100), ("source", "Parameter source", 230)):
+            self.builder_tree.heading(key, text=label)
+            self.builder_tree.column(key, width=width)
+        self.builder_tree.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.builder_tree.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.builder_tree.configure(yscrollcommand=scrollbar.set)
+        self.builder_tree.bind("<<TreeviewSelect>>", self._builder_selected)
+        controls = ttk.Frame(tab)
+        controls.pack(fill="x", pady=9)
+        ttk.Label(controls, text="Source").pack(side="left")
+        self.builder_source_var = tk.StringVar()
+        self.builder_source_box = ttk.Combobox(controls, textvariable=self.builder_source_var,
+                                                state="readonly", width=25)
+        self.builder_source_box.pack(side="left", padx=8)
+        ttk.Button(controls, text="Add / change selected", command=self.add_module).pack(side="left")
+        ttk.Button(controls, text="Remove selected", command=self.remove_module).pack(side="left", padx=9)
+        ttk.Button(tab, text="Restore published model", command=self.reset_parameters).pack(
+            anchor="w", pady=5)
+        self.builder_status_var = tk.StringVar()
+        ttk.Label(tab, textvariable=self.builder_status_var, foreground="#41536a").pack(
+            anchor="w", pady=8)
+
+    def _current_modules(self):
+        if self.composition is not None:
+            return dict(self.composition["channels"])
+        name = self.model_var.get()
+        return {key: name for key in available_channels(name)}
+
+    def refresh_builder(self):
+        previous = self.builder_tree.selection()
+        self.builder_tree.delete(*self.builder_tree.get_children())
+        chosen = self._current_modules()
+        for key, label in CHANNEL_LABELS.items():
+            self.builder_tree.insert("", "end", iid=key, values=(
+                key, label, "Yes" if key in chosen else "No", chosen.get(key, "")))
+        if previous and previous[0] in CHANNEL_LABELS:
+            self.builder_tree.selection_set(previous[0])
+        self.builder_status_var.set(
+            f'{"Custom assembly" if self.composition is not None else "Published model"} | '
+            f'{len(chosen)} selected channels | Na and Ca states in custom assemblies')
+
+    def _builder_selected(self, event=None):
+        selected = self.builder_tree.selection()
+        if not selected:
+            return
+        key = selected[0]
+        sources = channel_sources(key)
+        self.builder_source_box.configure(values=sources)
+        self.builder_source_var.set(self._current_modules().get(key, sources[0]))
+
+    def _set_composition(self, modules):
+        if self.worker and self.worker.is_alive():
+            self.status_var.set("Wait for the current calculation before changing modules")
+            self.refresh_builder()
+            return
+        try:
+            spec = compose_model(self.model_var.get(),
+                                 {"channels": modules})
+        except ValueError as exc:
+            messagebox.showerror("Build model", str(exc), parent=self)
+            self.refresh_builder()
+            return
+        old_modules = self._current_modules()
+        old_parameters, old_ranges, old_points = self.parameters, self.ranges, self.points
+        def origin(key, selected):
+            return selected.get("gUNaV") if key in ("x", "y") else selected.get(key)
+        self.parameters = {key: (old_parameters[key] if key in old_parameters and
+                                 origin(key, old_modules) == origin(key, modules)
+                                 else value)
+                           for key, value in spec["parameters"].items()}
+        self.ranges = {key: (old_ranges[key] if key in old_ranges and
+                             origin(key, old_modules) == origin(key, modules)
+                             else domain)
+                       for key, domain in spec["ranges"].items()}
+        self.points = {key: old_points.get(key, 24) for key in self.ranges}
+        self.fixed_values = {key: self.fixed_values.get(key, value)
+                             for key, value in spec["fixed"].items()}
+        self.composition = spec["composition"]
+        self.disabled_channels &= set(modules)
+        self.groups = []
+        self.sweep_basis_var.set("edited")
+        self.sweep_basis_box.configure(values=("edited",))
+        self.refresh_builder()
+        self.refresh_channels()
+        self.refresh_params()
+        self.refresh_fixed()
+        self.refresh_groups()
+        self._write_text(self.formulas_text, equations_for(
+            self.model_var.get(), self.disabled_channels, self.composition))
+        self._refresh_sources(spec)
+        self.status_var.set(f"Custom model: {len(modules)} channels; searches reset")
+
+    def add_module(self):
+        selected = self.builder_tree.selection()
+        if not selected:
+            return
+        key = selected[0]
+        source = self.builder_source_var.get()
+        if source not in channel_sources(key):
+            messagebox.showerror("Build model", "Choose a listed source model", parent=self)
+            return
+        modules = self._current_modules()
+        modules[key] = source
+        self._set_composition(modules)
+
+    def remove_module(self):
+        selected = self.builder_tree.selection()
+        if not selected:
+            return
+        modules = self._current_modules()
+        modules.pop(selected[0], None)
+        self._set_composition(modules)
+
     def refresh_channels(self):
         for widget in self.channel_grid.winfo_children():
             widget.destroy()
         self.channel_vars = {}
-        for i, (key, label) in enumerate(available_channels(self.model_var.get()).items()):
+        for i, (key, label) in enumerate(available_channels(
+                self.model_var.get(), self.composition).items()):
             variable = tk.BooleanVar(value=key not in self.disabled_channels)
             self.channel_vars[key] = variable
             ttk.Checkbutton(self.channel_grid, text=f"{label}  ({key})", variable=variable,
@@ -236,7 +368,8 @@ class PaperApp(tk.Tk):
         self.refresh_groups()
         self.refresh_params()
         self._write_text(self.formulas_text, equations_for(self.model_var.get(),
-                                                           self.disabled_channels))
+                                                           self.disabled_channels,
+                                                           self.composition))
         self.status_var.set(f"{key}: {'off (g=0)' if key in self.disabled_channels else 'on'}")
 
     def enable_all_channels(self):
@@ -246,7 +379,8 @@ class PaperApp(tk.Tk):
         for variable in self.channel_vars.values():
             variable.set(True)
         self.refresh_params()
-        self._write_text(self.formulas_text, equations_for(self.model_var.get()))
+        self._write_text(self.formulas_text, equations_for(
+            self.model_var.get(), composition=self.composition))
         self.status_var.set("All channels on")
 
     def _build_search(self):
@@ -276,9 +410,10 @@ class PaperApp(tk.Tk):
         kind_box.grid(row=3, column=1, sticky="w")
         kind_box.bind("<<ComboboxSelected>>", self.refresh_search_preview)
         ttk.Label(tab, text="Sweep bounds").grid(row=3, column=2, sticky="e", padx=8)
-        ttk.Combobox(tab, textvariable=self.sweep_basis_var,
-                     values=("edited", "paper"), state="readonly", width=13).grid(
-                         row=3, column=3, sticky="w")
+        self.sweep_basis_box = ttk.Combobox(tab, textvariable=self.sweep_basis_var,
+                                             values=("edited", "paper"),
+                                             state="readonly", width=13)
+        self.sweep_basis_box.grid(row=3, column=3, sticky="w")
         ttk.Label(tab, text="Random: 24 draws per parameter = 24 pairs. Sweep: 24 × 24 levels = 576 pairs. Paper bounds are for sweep.",
                   foreground="#526070").grid(row=4, column=0, columnspan=4, sticky="w", pady=8)
         ttk.Button(tab, text="Add selected parameters as a search", command=self.add_group).grid(
@@ -353,24 +488,37 @@ class PaperApp(tk.Tk):
         validate_assignment(self.role_var.get(), self.model_var.get())
         self.loaded_model = self.model_var.get()
         spec = get_model(self.model_var.get())
+        self.composition = None
         self.parameters = copy.deepcopy(spec["parameters"])
         self.fixed_values = copy.deepcopy(spec["fixed"])
         self.ranges = copy.deepcopy(spec["ranges"])
         self.points = {key: 24 for key in self.ranges}
         self.disabled_channels = set()
         self.groups = []
+        self.sweep_basis_box.configure(values=("edited", "paper"))
+        self.sweep_basis_var.set("edited")
+        self.refresh_builder()
         self.refresh_channels()
         self.refresh_params()
         self.refresh_groups()
         self.refresh_fixed()
         self._write_text(self.formulas_text, equations_for(self.model_var.get()))
+        self._refresh_sources(spec)
+        self.status_var.set(f"{self.role_var.get()} / {self.model_var.get()} | CPUs: {self.cpus}")
+
+    def _refresh_sources(self, spec):
+        note = ("Custom channel assembly: parameter sources are recorded in outputs. "
+                "The summed hybrid and its behavior are not "
+                "validated published models. Custom sweeps use edited bounds only."
+                if self.composition is not None else
+                "Published equation set. Edited values, bounds and channel switches "
+                "are saved as experimental settings.")
         self._write_text(self.source_text,
             "Equations: " + spec["equations"] + "\n\nRepresentative values: " + spec["baseline"]
             + "\n\nRanges and sampling: " + spec["search"] + "\n\n"
-            + "The I role assigns Tatsuki AN or Yamada RAN equations as a research assumption. "
-            + "This release simulates single cells. Automatic SWO labels require visual review. "
-            + "Edited values, bounds and channel switches are saved as experimental settings.")
-        self.status_var.set(f"{self.role_var.get()} / {self.model_var.get()} | CPUs: {self.cpus}")
+            + "The I role is a research assignment, not a cell-type-specific fit. "
+            + "Single cells are simulated; automatic SWO labels require visual review.\n\n"
+            + note)
 
     def on_role_selected(self, event=None):
         if self.worker and self.worker.is_alive():
@@ -398,8 +546,8 @@ class PaperApp(tk.Tk):
 
     def refresh_params(self):
         self.params_tree.delete(*self.params_tree.get_children())
-        original = get_model(self.model_var.get())["ranges"]
-        channels = available_channels(self.model_var.get())
+        original = effective_model(self.model_var.get(), self.composition)["ranges"]
+        channels = available_channels(self.model_var.get(), self.composition)
         for key, domain in self.ranges.items():
             self.params_tree.insert("", "end", iid=key, values=(
                 key, f"{self.parameters[key]:.9g}", f"{domain[0]:.9g}",
@@ -411,7 +559,7 @@ class PaperApp(tk.Tk):
     def refresh_search_params(self):
         selected = set(self.search_params_tree.selection())
         self.search_params_tree.delete(*self.search_params_tree.get_children())
-        channels = available_channels(self.model_var.get())
+        channels = available_channels(self.model_var.get(), self.composition)
         for key, (low, high, dist, unit) in self.ranges.items():
             self.search_params_tree.insert("", "end", iid=key, values=(
                 key, f"{self.parameters[key]:.9g}", f"{low:.9g}",
@@ -455,7 +603,7 @@ class PaperApp(tk.Tk):
 
     def refresh_fixed(self):
         self.fixed_tree.delete(*self.fixed_tree.get_children())
-        published = get_model(self.model_var.get())["fixed"]
+        published = effective_model(self.model_var.get(), self.composition)["fixed"]
         for key, value in self.fixed_values.items():
             origin = "Edited" if value != published[key] else "Published value"
             if key == "VL" and self.model_var.get().startswith("Sato"):
@@ -468,7 +616,7 @@ class PaperApp(tk.Tk):
             return
         key = selected[0]
         value = simpledialog.askfloat(key, f"{key} value (published: "
-                                      f'{get_model(self.model_var.get())["fixed"][key]:.9g})',
+                                      f'{effective_model(self.model_var.get(), self.composition)["fixed"][key]:.9g})',
                                       initialvalue=self.fixed_values[key], parent=self)
         if value is None:
             return
@@ -510,6 +658,9 @@ class PaperApp(tk.Tk):
             messagebox.showerror("Combination", "Turn on a channel before using it as a search axis.", parent=self)
             return
         basis = self.sweep_basis_var.get()
+        if kind == "sweep" and self.composition is not None and basis != "edited":
+            messagebox.showerror("Sweep", "Custom assemblies use edited bounds only.", parent=self)
+            return
         if (kind == "sweep" and basis == "paper" and any(
                 key not in ("x", "y") and self.parameters[key] == 0 for key in selected)):
             messagebox.showerror("Sweep", "A zero baseline needs edited bounds.", parent=self)
@@ -586,15 +737,16 @@ class PaperApp(tk.Tk):
                                                 self.role_var.get(),
                                                 copy.deepcopy(self.parameters),
                                                 copy.deepcopy(self.fixed_values),
-                                                tuple(sorted(self.disabled_channels)), out))
+                                                tuple(sorted(self.disabled_channels)),
+                                                copy.deepcopy(self.composition), out))
         except ValueError as exc:
             messagebox.showerror("Baseline trace", str(exc), parent=self)
 
-    def _baseline_worker(self, model, cell_role, values, fixed, disabled, out):
+    def _baseline_worker(self, model, cell_role, values, fixed, disabled, composition, out):
         try:
             result = simulate(model, values, fixed_overrides=fixed, stop=self.cancel,
                               progress=lambda n, total: self.events.put(("wave_progress", (n, total))),
-                              disabled_channels=disabled)
+                              disabled_channels=disabled, composition=composition)
             result["cell_role"] = cell_role
             save_result(result, out)
             self.events.put(("done", (out, "Baseline completed")))
@@ -617,18 +769,19 @@ class PaperApp(tk.Tk):
                  copy.deepcopy(self.parameters),
                  copy.deepcopy(self.fixed_values), copy.deepcopy(self.ranges),
                  copy.deepcopy(self.groups), workers,
-                 tuple(sorted(self.disabled_channels)), out))
+                 tuple(sorted(self.disabled_channels)),
+                 copy.deepcopy(self.composition), out))
             self.progress_var.set(f"0 / {total:,}")
             self.book.select(self.results_tab)
         except ValueError as exc:
             messagebox.showerror("Search", str(exc), parent=self)
 
     def _search_worker(self, model, cell_role, values, fixed, ranges, groups,
-                       workers, disabled, out):
+                       workers, disabled, composition, out):
         try:
             run_search(model, ranges, groups, out, workers=workers,
                 baseline_parameters=values, fixed_overrides=fixed, cell_role=cell_role,
-                disabled_channels=disabled,
+                disabled_channels=disabled, composition=composition,
                 stop=self.cancel,
                 progress=lambda n, total, row: self.events.put(("progress", (n, total, row))))
             self.events.put(("done", (out, "Search stopped" if self.cancel.is_set() else "Search completed")))
@@ -738,22 +891,24 @@ class PaperApp(tk.Tk):
         row = self.visible_rows[int(selected[0])]
         try:
             model = row["model"]
-            names = get_model(model)["parameters"]
-            values = {k: float(row[k]) for k in names}
             config = json.loads((self.last_output/"search_config.json").read_text(encoding="utf-8"))
+            composition = config.get("composition")
+            names = effective_model(model, composition)["parameters"]
+            values = {k: float(row[k]) for k in names}
             fixed = config["fixed_values"]
             disabled = tuple(config.get("disabled_channels", ()))
             cell_role = row.get("cell_role") or config.get("cell_role", "E")
             out = self.last_output/row["group"]/f'candidate_{int(row["index"]):06d}'
-            self._begin(self._inspect_worker, (model, cell_role, values, fixed, disabled, out))
+            self._begin(self._inspect_worker,
+                        (model, cell_role, values, fixed, disabled, composition, out))
         except (ValueError, KeyError, OSError) as exc:
             messagebox.showerror("Trace", str(exc), parent=self)
 
-    def _inspect_worker(self, model, cell_role, values, fixed, disabled, out):
+    def _inspect_worker(self, model, cell_role, values, fixed, disabled, composition, out):
         try:
             result = simulate(model, values, fixed_overrides=fixed, stop=self.cancel,
                               progress=lambda n, total: self.events.put(("wave_progress", (n, total))),
-                              disabled_channels=disabled)
+                              disabled_channels=disabled, composition=composition)
             result["cell_role"] = cell_role
             save_result(result, out)
             self.events.put(("inspect", out))

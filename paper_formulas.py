@@ -1,5 +1,6 @@
 """Readable equations for the supported paper-derived neuron models."""
-from paper_catalog import get_model, validate_disabled_channels
+from paper_catalog import (CHANNEL_LABELS, effective_model, get_model,
+                           validate_disabled_channels)
 
 
 CHANNELS = {
@@ -81,10 +82,60 @@ CHANNEL_PARAMETER = {
 }
 
 
-def equations_for(model_name, disabled_channels=()):
+def _composed_equations(model_name, spec, disabled):
+    channels = spec["composition"]["channels"]
+    names = {"gL": "leak", "gLeak": "nan_leak", "gNa": "na",
+             "gUNaV": "unav", "gNaP": "nap", "gK": "kv", "gKNa": "kna",
+             "gA": "a",
+             "gKS": "ks", "gAR": "ar", "gCa": "ca", "gKCa": "kca",
+             "gAMPA": "ampa", "gNMDA": "nmda", "gGABA": "gaba"}
+    currents = {"gL": "I_L", "gLeak": "I_leak", "gNa": "I_Na",
+                "gUNaV": "I_UNaV", "gNaP": "I_NaP", "gK": "I_K",
+                "gKNa": "I_KNa", "gA": "I_A", "gKS": "I_KS", "gAR": "I_AR",
+                "gCa": "I_Ca", "gKCa": "I_KCa", "gAMPA": "I_AMPA",
+                "gNMDA": "I_NMDA", "gGABA": "I_GABA"}
+    intrinsic = [currents[key] for key in channels if key not in
+                 ("gAMPA", "gNMDA", "gGABA")]
+    synaptic = [currents[key] for key in channels if key in
+                ("gAMPA", "gNMDA", "gGABA")]
+    membrane = ("C A dV/dt = −A(" + " + ".join(intrinsic or ["0"]) + ")"
+                + (" − " + " − ".join(synaptic) if synaptic else ""))
+    sodium = [current for key, current in
+              (("gNa", "I_Na"), ("gNaP", "I_NaP"),
+               ("gUNaV", "I_UNaV"), ("gLeak", "I_Na,NALCN")) if key in channels]
+    na_balance = ("d[Na]/dt = {−αNa(10A)(" + " + ".join(sodium or ["0"])
+                  + ") − 1000[Na]/τNa}/1000")
+    ca_currents = [term for key, term in
+                   (("gCa", "I_Ca"), ("gLeak", "I_Ca,NALCN")) if key in channels]
+    ca_influx = "10A(" + " + ".join(ca_currents or ["0"]) + ")"
+    ca_balance = "d[Ca]/dt = −αCa(" + ca_influx + ") − [Ca]/τCa"
+    if "gLeak" in channels:
+        ca_balance += "\nI_Ca,NALCN = 0.25 gLeNa(V − VCa)"
+    sections = ["CUSTOM CHANNEL ASSEMBLY | " + model_name + " template",
+                "Membrane currents and ion balances combine published terms; "
+                "this hybrid is not a published cell model.",
+                "MEMBRANE POTENTIAL\n" + membrane,
+                "ION CONCENTRATION\n" + na_balance + "\n" + ca_balance +
+                "\nCa balance: " + spec["composition"]["calcium_source"]]
+    for key in CHANNEL_LABELS:
+        if key not in channels:
+            continue
+        module = CHANNELS[names[key]]
+        if key in disabled:
+            module = module.splitlines()[0] + f" — OFF\n{key} = 0; this current is zero."
+        sections.append(module + "\nSource: " +
+                        ("Tatsuki 2016 AN" if key == "gA" else channels[key]))
+    sections.append("Units: V in mV, time in ms, A in mm². Intrinsic currents are "
+                    "µA/cm²; synaptic currents are nA. The density-to-nA factor is 10A.")
+    return "\n\n".join(sections)
+
+
+def equations_for(model_name, disabled_channels=(), composition=None):
     """Return only the currents and gates active in the selected model."""
-    spec = get_model(model_name)
-    disabled = set(validate_disabled_channels(model_name, disabled_channels))
+    spec = effective_model(model_name, composition)
+    disabled = set(validate_disabled_channels(model_name, disabled_channels, composition))
+    if composition is not None:
+        return _composed_equations(model_name, spec, disabled)
     family = spec["family"]
     if family == "AN":
         membrane = ("C A dV/dt = −A(I_L + I_Na + I_K + I_A + I_KS + I_Ca + "

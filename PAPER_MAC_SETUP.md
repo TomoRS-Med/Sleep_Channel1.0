@@ -8,6 +8,8 @@ The builder selects a Python interpreter compatible with the Mac's CPU. If it re
 
 Select E or I and a model at the top. Tatsuki AN is available for both roles. The Values and bounds tab edits representative values and constants. The Channels tab has an on/off switch for each conductance; switching one off applies g=0 to traces and searches. The Equations tab groups membrane, concentration, current and gate equations by channel and marks off currents.
 
+To build a custom single-cell model, open **Build model**. Select a channel row, choose the paper model supplying its starting value and range, then click **Add / change selected**. Use **Remove selected** to exclude a current. All included models' channel types are listed, including FNAN channels. The equations view updates with the assembled model. The output records the selected modules. A custom assembly is exploratory; use edited bounds for sweeps. **Restore published model** returns to the selected paper model.
+
 To run a joint search:
 
 1. Select any channel switches first. Switching off a channel removes searches that vary it. In Combinations and run, select multiple parameter rows. Use Command-click for nonadjacent rows.

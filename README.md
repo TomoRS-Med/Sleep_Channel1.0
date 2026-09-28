@@ -9,6 +9,8 @@ A Python/Tkinter app for single-cell models on macOS. See `PAPER_MAC_SETUP.md` f
 
 The Values and bounds tab displays representative parameters and editable search domains. The Equations tab groups currents and gates by channel. The Channels tab lets you turn individual conductances off (g=0) for baseline traces and searches. Re-enabling a channel restores its edited representative value.
 
+The **Build model** tab assembles a custom single-cell model from any channel in the included paper models, including those in FNAN. Select a row, choose a parameter source, and add, change or remove the channel. The source supplies its representative conductance and default range; the Values and bounds tab can then edit them. The custom model sums the selected currents and records its configuration with every run. It is a new exploratory combination, not a fitted or published cell model. Changing modules resets queued searches; custom sweeps use edited bounds.
+
 ## Joint search
 
 Each selected parameter has its own range, distribution and draw / sweep-level count (24 by default). For two parameters with counts of 24 each, random computes 24 conditions and sweep computes 24 × 24 = 576 conditions. For four parameters:
@@ -22,4 +24,4 @@ Search defaults include Sato intrinsic conductances at 0.01–100 mS/cm² and sy
 
 Outputs include `summary.csv`, `search_config.json`, candidate plots and compressed state arrays. Automatic SWO candidates require visual review.
 
-This release runs single-cell searches. It does not simulate an E–I network or provide a GUI for adding arbitrary new equations. See `PAPER_PROVENANCE.md` for sources and validation scope.
+This release runs single-cell searches. It does not simulate an E–I network or provide a GUI for authoring arbitrary new channel equations. See `PAPER_PROVENANCE.md` for sources and validation scope.

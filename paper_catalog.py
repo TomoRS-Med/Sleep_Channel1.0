@@ -143,14 +143,74 @@ CHANNEL_LABELS = {
 }
 
 
-def available_channels(model_name):
-    return {key: CHANNEL_LABELS[key] for key in get_model(model_name)["parameters"]
+def channel_sources(key):
+    """Published equation sets that contain this conductance."""
+    if key not in CHANNEL_LABELS:
+        raise ValueError("Unknown channel: " + str(key))
+    return tuple(name for name, spec in MODELS.items() if key in spec["parameters"])
+
+
+def compose_model(base_model, composition):
+    """Build a new, explicitly experimental sum of published current modules."""
+    base = get_model(base_model)
+    if not isinstance(composition, dict) or not isinstance(composition.get("channels"), dict):
+        raise ValueError("A composed model needs a channel-to-source selection")
+    requested = composition["channels"]
+    if not requested or not set(requested) <= set(CHANNEL_LABELS):
+        raise ValueError("Select at least one published channel module")
+    calcium_source = "Sato 2025 FNAN"
+    if composition.get("calcium_source", calcium_source) != calcium_source:
+        raise ValueError("The composed Ca balance must use Sato 2025 FNAN")
+    channels = {key: requested[key] for key in CHANNEL_LABELS if key in requested}
+    for key, source in channels.items():
+        if source not in channel_sources(key):
+            raise ValueError(f"{key} is not defined in {source}")
+    parameters = {key: MODELS[source]["parameters"][key]
+                  for key, source in channels.items()}
+    ranges = {key: MODELS[source]["ranges"][key]
+              for key, source in channels.items()}
+    if "gUNaV" in channels:
+        source = MODELS[channels["gUNaV"]]
+        for key in ("x", "y"):
+            parameters[key], ranges[key] = source["parameters"][key], source["ranges"][key]
+    ca_source = (base_model if "tauCa" in base["parameters"] else
+                 next((channels[k] for k in ("gCa", "gKCa")
+                       if k in channels and "tauCa" in MODELS[channels[k]]["parameters"]),
+                      calcium_source))
+    na_source = (base_model if "tauNa" in base["parameters"] else
+                 next((channels[k] for k in ("gUNaV", "gKNa", "gLeak")
+                       if k in channels and "tauNa" in MODELS[channels[k]]["parameters"]),
+                      "Sato 2025 FNAN"))
+    for key, source in (("tauCa", ca_source), ("tauNa", na_source)):
+        parameters[key] = MODELS[source]["parameters"][key]
+        ranges[key] = MODELS[source]["ranges"][key]
+    sources = tuple(dict.fromkeys((base_model, *channels.values(),
+                                   *(('Tatsuki 2016 AN',) if 'gA' in channels else ()),
+                                   calcium_source, ca_source, na_source)))
+    return {
+        "family": "COMPOSED", "duration_ms": 20000.0,
+        "analysis_from_ms": 10000.0, "bifurcation": base["bifurcation"],
+        "fixed": {**FNAN_FIXED, **base["fixed"]},
+        "parameters": parameters, "ranges": ranges,
+        "composition": {"channels": channels, "calcium_source": calcium_source},
+        "equations": "Published channel equations from " + ", ".join(sources),
+        "baseline": "Per-channel representative values from the selected source models",
+        "search": "Per-channel default ranges from the selected source models",
+    }
+
+
+def effective_model(model_name, composition=None):
+    return get_model(model_name) if composition is None else compose_model(model_name, composition)
+
+
+def available_channels(model_name, composition=None):
+    return {key: CHANNEL_LABELS[key] for key in effective_model(model_name, composition)["parameters"]
             if key in CHANNEL_LABELS}
 
 
-def validate_disabled_channels(model_name, disabled_channels):
+def validate_disabled_channels(model_name, disabled_channels, composition=None):
     disabled = set(disabled_channels or ())
-    if not disabled <= set(available_channels(model_name)):
+    if not disabled <= set(available_channels(model_name, composition)):
         raise ValueError("A disabled channel must be a conductance in the selected model")
     return tuple(sorted(disabled))
 
@@ -169,7 +229,7 @@ def get_model(name):
 def validate_ranges(model, ranges, groups):
     allowed = set(model["ranges"])
     if set(ranges) != allowed:
-        raise ValueError("The range table must contain exactly the published search parameters")
+        raise ValueError("The range table must contain exactly the selected model parameters")
     for key, (lo, hi, distribution, _) in ranges.items():
         if (not math.isfinite(lo) or not math.isfinite(hi) or not lo < hi
                 or distribution not in ("log", "uniform", "neglog")

@@ -15,7 +15,7 @@ import numpy as np
 from scipy.integrate import ODEintWarning, odeint
 from scipy.signal import detrend, periodogram
 
-from paper_catalog import get_model, validate_disabled_channels
+from paper_catalog import FNAN_SATO, effective_model, validate_disabled_channels
 
 
 def _exp(x):
@@ -138,15 +138,18 @@ def _nan_rhs(state, t, p, c):
     ]
 
 
-def _fnan_rhs(state, t, p, c):
-    """Sato's full NAN/AN currents, with both Na and Ca efflux time constants."""
+def _fnan_rhs(state, t, p, c, composition=None):
+    """Sato's full current set, optionally composing published channel modules."""
     v, h_unav, nk, na_mM, hna, ha, mks, ca, sa, sn, xn, sg = state
     vk, vna, vca = c["VK"], c["VNa"], c["VCa"]
     munav, ah_u, bh_u = _na_gates(v, p["x"], p["y"])
     mna, ah, bh = _na_gates(v)
     an = _alpha(v + 34.0, .01)
     bn = .125*_exp(-(v + 44.0)/25.0)
-    ma = _sigmoid((v + 44.0)/50.0)  # Sato Eq. 41, not Tatsuki's mA.
+    if composition is not None:
+        ma = _sigmoid((v + 50.0)/20.0)
+    else:
+        ma = _sigmoid((v + 44.0)/50.0)  # Sato Eq. 41.
     ha_inf = _sigmoid(-(v + 80.0)/6.0)
     mks_inf = _sigmoid((v + 34.0)/6.5)
     tau_mks = 8.0/(_exp(-(v + 55.0)/30.0) + _exp((v + 55.0)/30.0))
@@ -163,7 +166,7 @@ def _fnan_rhs(state, t, p, c):
     i_na_nalcn = .44*g_lena*(v-vna)
     i_ca_nalcn = .25*g_lena*(v-vca)
     intrinsic = (
-        p["gLeak"]*(v-c["VL"]) + p["gK"]*nk**4*(v-vk)
+        p.get("gL", 0.0)*(v-c["VL"]) + p["gLeak"]*(v-c["VL"]) + p["gK"]*nk**4*(v-vk)
         + i_unav + p["gKNa"]*mkna*(v-vk) + i_ca + i_na
         + p["gA"]*ma**3*ha*(v-vk) + p["gKS"]*mks*(v-vk)
         + p["gKCa"]*mkca*(v-vk) + i_nap + p["gAR"]*har*(v-vk)
@@ -173,6 +176,7 @@ def _fnan_rhs(state, t, p, c):
               + p["gGABA"]*sg*(v-c["VGABA"]))
     density_to_nA = 10.0*c["A_mm2"]
     f = _sigmoid((v-20.0)/2.0)
+    ca_influx = density_to_nA*(i_ca+i_ca_nalcn)
     return [
         -(intrinsic+syn_nA/density_to_nA)/c["C"],
         4.0*(ah_u*(1.0-h_unav)-bh_u*h_unav),
@@ -182,7 +186,7 @@ def _fnan_rhs(state, t, p, c):
         4.0*(ah*(1.0-hna)-bh*hna),
         (ha_inf-ha)/c["tau_hA"],
         (mks_inf-mks)/tau_mks,
-        -c["alphaCa"]*density_to_nA*(i_ca+i_ca_nalcn)-ca/p["tauCa"],
+        -c["alphaCa"]*ca_influx-ca/p["tauCa"],
         3.48*f-sa/c["tauAMPA"],
         .5*xn*(1.0-sn)-sn/c["tau_sNMDA"],
         3.48*f-xn/c["tau_xNMDA"],
@@ -191,15 +195,15 @@ def _fnan_rhs(state, t, p, c):
 
 
 def simulate(model_name, parameters=None, record_ms=1.0, fixed_overrides=None,
-             progress=None, stop=None, disabled_channels=()):
-    spec = get_model(model_name)
+             progress=None, stop=None, disabled_channels=(), composition=None):
+    spec = effective_model(model_name, composition)
     p = dict(spec["parameters"])
     c = dict(spec["fixed"])
     if parameters:
         if not set(parameters) <= set(p):
             raise ValueError("Only PDF-defined parameters can be changed")
         p.update(parameters)
-    disabled = validate_disabled_channels(model_name, disabled_channels)
+    disabled = validate_disabled_channels(model_name, disabled_channels, composition)
     for key in disabled:
         p[key] = 0.0
     if fixed_overrides:
@@ -238,6 +242,18 @@ def simulate(model_name, parameters=None, record_ms=1.0, fixed_overrides=None,
         rhs = _fnan_rhs
         state_names = ("voltage_mV", "hUNaV", "nK", "Na_mM", "hNa",
                        "hA", "mKS", "Ca_uM", "sAMPA", "sNMDA", "xNMDA", "sGABA")
+    elif spec["family"] == "COMPOSED":
+        # Keep the published full-model states; absent currents have g=0.
+        y0 = [-45.0, .045, .54, 1.0, .045, .045, .34, 1.0,
+              .01, .01, .01, .01]
+        state_names = ("voltage_mV", "hUNaV", "nK", "Na_mM", "hNa",
+                       "hA", "mKS", "Ca_uM", "sAMPA", "sNMDA", "xNMDA", "sGABA")
+        calc_p = {key: 0.0 for key in FNAN_SATO if key.startswith("g")}
+        calc_p.update({"gL": 0.0, "x": 0.0, "y": 0.0})
+        calc_p.update(p)
+        rhs = lambda state, time, params, const: _fnan_rhs(
+            state, time, params, const, spec["composition"])
+        p_for_ode = calc_p
     elif spec["family"] in ("SAN", "RAN"):
         y0 = [-45.0, .54 if spec["family"] == "SAN" else .34, 1.0]
         rhs = lambda state, t, params, const: _reduced_rhs(
@@ -245,10 +261,12 @@ def simulate(model_name, parameters=None, record_ms=1.0, fixed_overrides=None,
         state_names = ("voltage_mV", "nK" if spec["family"] == "SAN" else "mKS", "Ca_uM")
     else:
         raise ValueError("Unsupported PDF family: " + spec["family"])
+    if spec["family"] != "COMPOSED":
+        p_for_ode = p
     with warnings.catch_warnings():
         warnings.simplefilter("error", ODEintWarning)
         if progress is None:
-            states, info = odeint(rhs, y0, t, args=(p, c), rtol=1e-7,
+            states, info = odeint(rhs, y0, t, args=(p_for_ode, c), rtol=1e-7,
                                   atol=1e-9, mxstep=5000, full_output=True)
         else:
             # Integrate in consecutive 500 ms blocks to report real simulated
@@ -260,7 +278,7 @@ def simulate(model_name, parameters=None, record_ms=1.0, fixed_overrides=None,
                 if stop is not None and stop.is_set():
                     raise InterruptedError("Simulation stopped")
                 end = min(start+block_size, len(t)-1)
-                part, info = odeint(rhs, last, t[start:end+1], args=(p, c),
+                part, info = odeint(rhs, last, t[start:end+1], args=(p_for_ode, c),
                                     rtol=1e-7, atol=1e-9, mxstep=5000, full_output=True)
                 if "successful" not in info["message"].lower() or not np.all(np.isfinite(part)):
                     raise FloatingPointError("ODE solver did not converge")
@@ -271,6 +289,9 @@ def simulate(model_name, parameters=None, record_ms=1.0, fixed_overrides=None,
     if "successful" not in info["message"].lower() or not np.all(np.isfinite(states)):
         raise FloatingPointError("ODE solver did not converge")
     return {"model": model_name, "parameters": p, "fixed": c,
+            "composition": spec.get("composition"),
+            "model_display": ("Custom channels (" + model_name + " template)"
+                              if composition is not None else model_name),
             "disabled_channels": disabled, "time_ms": t,
             "states": states, "state_names": state_names,
             "analysis_from_ms": spec["analysis_from_ms"]}
@@ -319,8 +340,10 @@ def save_result(result, directory):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     metric = classify(result)
-    spec = get_model(result["model"])
+    spec = effective_model(result["model"], result.get("composition"))
     payload = {"model": result["model"],
+               "model_display": result.get("model_display", result["model"]),
+               "composition": result.get("composition"),
                "cell_role": result.get("cell_role", "unassigned"),
                "cell_role_note": "The E/I role is a research assignment, not a cell-type-specific fit",
                "parameters": result["parameters"],
@@ -342,7 +365,7 @@ def save_result(result, directory):
     ax[1].plot(t, result["states"][:, result["state_names"].index(ion_name)],
                color="#b34b8b", lw=1)
     ax[1].set_ylabel("Ca (µM)" if ion_name == "Ca_uM" else "Na (mM)")
-    if spec["family"] == "FNAN":
+    if spec["family"] in ("FNAN", "COMPOSED"):
         ax_ca = ax[1].twinx()
         ax_ca.plot(t, result["states"][:, result["state_names"].index("Ca_uM")],
                    color="#3b9564", lw=.8, alpha=.75)
@@ -352,7 +375,8 @@ def save_result(result, directory):
         a.axvspan(0, result["analysis_from_ms"]/1000.0, color="#dce3ea", alpha=.45)
     role = result.get("cell_role")
     off = result.get("disabled_channels", ())
-    fig.suptitle((role + " | " if role else "") + result["model"] + " | " + metric["label"]
+    fig.suptitle((role + " | " if role else "") + result.get("model_display", result["model"])
+                 + " | " + metric["label"]
                  + (" | OFF: " + ", ".join(off) if off else ""))
     fig.tight_layout()
     fig.savefig(directory/"trace.png")

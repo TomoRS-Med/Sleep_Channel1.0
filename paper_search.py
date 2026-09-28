@@ -13,7 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
-from paper_catalog import (get_model, validate_assignment, validate_ranges,
+from paper_catalog import (effective_model, validate_assignment, validate_ranges,
                            validate_disabled_channels)
 from paper_engine import classify, save_result, simulate
 
@@ -91,8 +91,9 @@ def _random_draws(low, high, distribution, count, master_seed, group_index, axis
 
 
 def candidate_parameters(model_name, ranges, group, index, master_seed, group_index,
-                         baseline_parameters=None, return_indices=False):
-    spec = get_model(model_name)
+                         baseline_parameters=None, return_indices=False,
+                         composition=None):
+    spec = effective_model(model_name, composition)
     base = dict(spec["parameters"])
     if baseline_parameters is not None:
         if set(baseline_parameters) != set(base):
@@ -116,15 +117,16 @@ def candidate_parameters(model_name, ranges, group, index, master_seed, group_in
 
 def _evaluate(task):
     (model_name, cell_role, parameters, fixed_values, group_name, index,
-     candidate_seed, chosen, output, retain, disabled) = task
+     candidate_seed, chosen, output, retain, disabled, composition) = task
     row = {"model": model_name, "cell_role": cell_role,
+           "configuration": "composed" if composition is not None else "published",
            "group": group_name, "index": index,
            "sampling_seed": candidate_seed,
            "choice_indices": ", ".join(f"{key}{number}" for key, number in chosen.items()),
            **parameters}
     try:
         result = simulate(model_name, parameters, fixed_overrides=fixed_values,
-                          disabled_channels=disabled)
+                          disabled_channels=disabled, composition=composition)
         result["cell_role"] = cell_role
         metric = classify(result)
         row.update(metric)
@@ -150,10 +152,10 @@ def _valid_group_name(name):
 def run_search(model_name, ranges, groups, output, workers=None, master_seed=None,
                retain=("SWO_candidate",), progress=None, stop=None,
                baseline_parameters=None, fixed_overrides=None, cell_role="E",
-               disabled_channels=()):
-    spec = get_model(model_name)
+               disabled_channels=(), composition=None):
+    spec = effective_model(model_name, composition)
     validate_assignment(cell_role, model_name)
-    disabled = validate_disabled_channels(model_name, disabled_channels)
+    disabled = validate_disabled_channels(model_name, disabled_channels, composition)
     validate_ranges(spec, ranges, [group["parameters"] for group in groups])
     if len({_valid_group_name(group["name"]) for group in groups}) != len(groups):
         raise ValueError("Combination names must be unique")
@@ -171,6 +173,8 @@ def run_search(model_name, ranges, groups, output, workers=None, master_seed=Non
             raise ValueError(f"Each combination must contain 1–{MAX_CONDITIONS:,} conditions")
         if group["kind"] == "sweep" and group.get("basis", "paper") not in ("paper", "edited"):
             raise ValueError("Sweep basis must be paper or edited")
+        if composition is not None and group["kind"] == "sweep" and group.get("basis", "paper") != "edited":
+            raise ValueError("Composed models use edited sweep bounds; they have no published joint sweep")
     if sum(group_total(group) for group in groups) > MAX_CONDITIONS:
         raise ValueError(f"A search can contain at most {MAX_CONDITIONS:,} conditions")
     workers = default_workers() if workers is None else int(workers)
@@ -201,6 +205,8 @@ def run_search(model_name, ranges, groups, output, workers=None, master_seed=Non
                     raise ValueError("A zero baseline needs an edited-range sweep: " + key)
     config = {
         "model": model_name, "source_equations": spec["equations"],
+        "configuration": "composed" if composition is not None else "published",
+        "composition": spec.get("composition"),
         "cell_role": cell_role,
         "cell_role_note": "The E/I role is a research assignment, not a cell-type-specific fit",
         "source_baseline": spec["baseline"], "source_search": spec["search"],
@@ -223,14 +229,16 @@ def run_search(model_name, ranges, groups, output, workers=None, master_seed=Non
         for gi, group in enumerate(groups):
             for i in range(group_total(group)):
                 params, chosen = candidate_parameters(model_name, ranges, group, i,
-                                                       master_seed, gi, baseline, True)
+                                                       master_seed, gi, baseline, True,
+                                                       composition=composition)
                 # The draw is reconstructed by (master, group, index).
                 yield (model_name, cell_role, params, fixed, group["name"], i,
-                       f"{master_seed}:{gi}:{i}", chosen, str(output), tuple(retain), disabled)
+                       f"{master_seed}:{gi}:{i}", chosen, str(output), tuple(retain),
+                       disabled, spec.get("composition"))
 
     tasks = iter(task_stream())
     rows = []
-    columns = ["model", "cell_role", "group", "index", "sampling_seed", "choice_indices",
+    columns = ["model", "cell_role", "configuration", "group", "index", "sampling_seed", "choice_indices",
                *spec["parameters"],
                "label", "peak_hz", "spikes_per_s", "min_mV", "max_mV",
                "manual_review_required", "trace_path", "error"]

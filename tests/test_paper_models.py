@@ -9,9 +9,11 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from paper_catalog import (CELL_ROLE_MODELS, available_channels, get_model,
+from paper_catalog import (CELL_ROLE_MODELS, CHANNEL_LABELS, FNAN_FIXED, FNAN_SATO,
+                           available_channels,
+                           channel_sources, compose_model, get_model,
                            validate_assignment)
-from paper_engine import classify, save_result, simulate
+from paper_engine import _fnan_rhs, classify, save_result, simulate
 from paper_formulas import equations_for
 from paper_search import candidate_parameters, choice_indices, group_total, run_search
 
@@ -113,6 +115,70 @@ class PaperModels(unittest.TestCase):
                 replay = candidate_parameters(name, ranges, group, row["index"], 81235, 0)
                 self.assertEqual(row["gKNa"], replay["gKNa"])
                 self.assertEqual(row["tauNa"], replay["tauNa"])
+
+    def test_custom_assembly_uses_selected_modules_and_fixed_ion_balance(self):
+        base = "Tatsuki 2016 AN"
+        composition = {"channels": {
+            "gL": base, "gLeak": "Sato 2025 FNAN",
+            "gUNaV": "Sato 2025 NAN", "gKNa": "Sato 2025 FNAN",
+            "gA": "Sato 2025 FNAN", "gCa": "Sato 2025 FNAN",
+            "gKCa": base, "gNMDA": base}}
+        self.assertEqual(set(CHANNEL_LABELS),
+                         {key for name in CELL_ROLE_MODELS["E"] + CELL_ROLE_MODELS["I"]
+                          for key in available_channels(name)})
+        self.assertIn("Sato 2025 FNAN", channel_sources("gA"))
+        spec = compose_model(base, composition)
+        self.assertEqual(spec["family"], "COMPOSED")
+        self.assertEqual(spec["parameters"]["gA"], get_model("Sato 2025 FNAN")["parameters"]["gA"])
+        self.assertTrue({"gL", "gLeak", "gUNaV", "gKNa", "tauCa", "tauNa", "x", "y"}
+                        <= set(spec["parameters"]))
+        equations = equations_for(base, composition=composition)
+        self.assertIn("mA∞ = 1/[1 + exp(−(V + 50)/20)]", equations)
+        self.assertIn("I_Ca,NALCN = 0.25 gLeNa(V − VCa)", equations)
+        self.assertNotIn("d[Ca]/dt = −αCa(10A I_Ca + I_NMDA)", equations)
+        only_a = {key: 0.0 for key in FNAN_SATO if key.startswith("g")}
+        only_a.update({"gL": 0.0, "gA": 1.0, "x": 0.0, "y": 0.0,
+                       "tauCa": 100.0, "tauNa": 3000.0})
+        state = [-80.0, .045, .54, 1.0, .045, 1.0, .34, 1.0,
+                 .01, .01, .01, .01]
+        derivative = _fnan_rhs(state, 0, only_a, FNAN_FIXED, spec["composition"])
+        activation = 1.0/(1.0+np.exp(-(-80.0+50.0)/20.0))
+        self.assertAlmostEqual(derivative[0], -activation**3*20.0/FNAN_FIXED["C"])
+        only_a["gNMDA"] = 1.0
+        with_nmda = _fnan_rhs(state, 0, only_a, FNAN_FIXED, spec["composition"])
+        self.assertEqual(derivative[7], with_nmda[7])
+        result = simulate(base, composition=composition, disabled_channels=("gNMDA",))
+        self.assertEqual(result["states"].shape[1], 12)
+        self.assertTrue(np.all(np.isfinite(result["states"])))
+        self.assertEqual(result["parameters"]["gNMDA"], 0.0)
+        self.assertEqual(result["composition"]["channels"], composition["channels"])
+        with self.assertRaises(ValueError):
+            compose_model(base, {"channels": {"gKNa": "Yamada 2022 RAN"}})
+
+    def test_custom_search_records_and_replays_assembly(self):
+        base = "Yoshida 2018 SAN"
+        composition = {"channels": {"gL": base, "gUNaV": "Sato 2025 NAN",
+                                     "gKNa": "Sato 2025 NAN", "gCa": base}}
+        spec = compose_model(base, composition)
+        group = {"name": "custom_gL", "kind": "random", "samples": 1,
+                 "parameters": ["gL"], "points": {"gL": 1}}
+        with tempfile.TemporaryDirectory() as directory:
+            rows = run_search(base, spec["ranges"], [group], directory,
+                              workers=1, master_seed=11, retain=(),
+                              composition=composition)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["configuration"], "composed")
+            self.assertNotEqual(rows[0]["label"], "ERROR")
+            config = json.loads((Path(directory)/"search_config.json").read_text())
+            self.assertEqual(config["composition"]["channels"], composition["channels"])
+            replay = candidate_parameters(base, spec["ranges"], group, 0, 11, 0,
+                                          composition=composition)
+            self.assertEqual(rows[0]["gL"], replay["gL"])
+            with self.assertRaisesRegex(ValueError, "edited sweep bounds"):
+                run_search(base, spec["ranges"],
+                           [{**group, "kind": "sweep", "basis": "paper"}],
+                           Path(directory)/"invalid", workers=1,
+                           composition=composition)
 
     def test_random_paired_draws_and_cartesian_sweep(self):
         model = "Sato 2025 NAN"

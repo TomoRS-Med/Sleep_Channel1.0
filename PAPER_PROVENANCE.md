@@ -11,4 +11,6 @@ Sweep levels use geometric spacing for positive ranges and linear spacing for si
 
 The simulation runs for 10 s and analyzes the last 5 s for Tatsuki, Yamada and Yoshida, or 20 s and the last 10 s for Sato. The recorded time step is 1 ms. The automatic classifier follows Sato et al., 2025: −20 mV crossings, an FFT peak, RESTING below 2 spikes/s, AWAKE at a peak of at least 10 Hz, and a SWO candidate when spikes/s exceeds five times a positive peak below 10 Hz. Visual waveform review is required for SWO candidates.
 
+Custom assemblies select channel currents and initial conductance values from the listed model sources. The summed current system is an exploratory hybrid, not itself a published model or a cell-type-specific fit. Custom runs use the full set of ion and gate states, run for 20 s, and analyze the last 10 s. Channel selections and value sources are saved in the output configuration; custom searches use edited bounds.
+
 Representative traces have not been verified for numerical identity with published figures. E/I labels in the app designate research assignments; the program does not fit inhibitory-cell physiology or implement network connections.
