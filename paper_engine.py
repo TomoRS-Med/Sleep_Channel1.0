@@ -16,6 +16,7 @@ from scipy.integrate import ODEintWarning, odeint
 from scipy.signal import detrend, periodogram
 
 from paper_catalog import FNAN_SATO, effective_model, validate_disabled_channels
+from custom_equations import compile_modules, module_parameters
 
 
 def _exp(x):
@@ -195,13 +196,15 @@ def _fnan_rhs(state, t, p, c, composition=None):
 
 
 def simulate(model_name, parameters=None, record_ms=1.0, fixed_overrides=None,
-             progress=None, stop=None, disabled_channels=(), composition=None):
+             progress=None, stop=None, disabled_channels=(), composition=None,
+             custom_modules=None):
     spec = effective_model(model_name, composition)
     p = dict(spec["parameters"])
+    p.update(module_parameters(custom_modules))
     c = dict(spec["fixed"])
     if parameters:
         if not set(parameters) <= set(p):
-            raise ValueError("Only PDF-defined parameters can be changed")
+            raise ValueError("Only selected model and custom parameters can be changed")
         p.update(parameters)
     disabled = validate_disabled_channels(model_name, disabled_channels, composition)
     for key in disabled:
@@ -218,7 +221,8 @@ def simulate(model_name, parameters=None, record_ms=1.0, fixed_overrides=None,
                    "tau_sNMDA", "tau_xNMDA", "tauGABA") and value <= 0:
             raise ValueError("Fixed value must be positive: " + key)
     for key, value in p.items():
-        if not math.isfinite(value) or (key not in ("x", "y") and value < 0):
+        if not math.isfinite(value) or (key in spec["parameters"] and
+                                         key not in ("x", "y") and value < 0):
             raise ValueError("Invalid value for " + key)
     if p.get("tauCa", 1) <= 0 or p.get("tauNa", 1) <= 0:
         raise ValueError("Time constants must be positive")
@@ -263,6 +267,35 @@ def simulate(model_name, parameters=None, record_ms=1.0, fixed_overrides=None,
         raise ValueError("Unsupported PDF family: " + spec["family"])
     if spec["family"] != "COMPOSED":
         p_for_ode = p
+    modules = compile_modules(custom_modules, spec["parameters"], c, state_names)
+    if modules:
+        base_rhs = rhs
+        base_count = len(y0)
+        offsets = []
+        for module in modules:
+            offsets.append(len(y0))
+            y0.extend(module.initial)
+            state_names += tuple(f"{module.name}.{key}" for key in module.states)
+        na_index = state_names.index("Na_mM") if "Na_mM" in state_names else None
+        ca_index = state_names.index("Ca_uM") if "Ca_uM" in state_names else None
+
+        def rhs(state, time, params, const):
+            derivatives = list(base_rhs(state[:base_count], time, params, const))
+            context = {**const, **p, "V": state[0], "t": time}
+            if na_index is not None:
+                context["Na"] = state[na_index]
+            if ca_index is not None:
+                context["Ca"] = state[ca_index]
+            for module, start in zip(modules, offsets):
+                current, na_rate, ca_rate, gates = module.evaluate(
+                    state[start:start+len(module.states)], context)
+                derivatives[0] -= current / const["C"]
+                if na_index is not None:
+                    derivatives[na_index] += na_rate
+                if ca_index is not None:
+                    derivatives[ca_index] += ca_rate
+                derivatives.extend(gates)
+            return derivatives
     with warnings.catch_warnings():
         warnings.simplefilter("error", ODEintWarning)
         if progress is None:
@@ -290,8 +323,10 @@ def simulate(model_name, parameters=None, record_ms=1.0, fixed_overrides=None,
         raise FloatingPointError("ODE solver did not converge")
     return {"model": model_name, "parameters": p, "fixed": c,
             "composition": spec.get("composition"),
+            "custom_modules": custom_modules or [],
             "model_display": ("Custom channels (" + model_name + " template)"
-                              if composition is not None else model_name),
+                              if composition is not None else model_name) +
+                             (" + " + ", ".join(m.name for m in modules) if modules else ""),
             "disabled_channels": disabled, "time_ms": t,
             "states": states, "state_names": state_names,
             "analysis_from_ms": spec["analysis_from_ms"]}
@@ -335,7 +370,13 @@ def classify(result):
 def save_result(result, directory):
     import matplotlib
     matplotlib.use("Agg")
+    from matplotlib import font_manager
     from matplotlib.figure import Figure
+
+    # macOS includes Arial. Embed the chosen TrueType font in vector PDFs.
+    installed = {font.name for font in font_manager.fontManager.ttflist}
+    matplotlib.rcParams["font.family"] = "Arial" if "Arial" in installed else "DejaVu Sans"
+    matplotlib.rcParams["pdf.fonttype"] = 42
 
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -344,6 +385,7 @@ def save_result(result, directory):
     payload = {"model": result["model"],
                "model_display": result.get("model_display", result["model"]),
                "composition": result.get("composition"),
+               "custom_modules": result.get("custom_modules", []),
                "cell_role": result.get("cell_role", "unassigned"),
                "cell_role_note": "The E/I role is a research assignment, not a cell-type-specific fit",
                "parameters": result["parameters"],
@@ -379,5 +421,5 @@ def save_result(result, directory):
                  + " | " + metric["label"]
                  + (" | OFF: " + ", ".join(off) if off else ""))
     fig.tight_layout()
-    fig.savefig(directory/"trace.png")
+    fig.savefig(directory/"trace.pdf", format="pdf")
     return metric

@@ -16,6 +16,7 @@ import numpy as np
 from paper_catalog import (effective_model, validate_assignment, validate_ranges,
                            validate_disabled_channels)
 from paper_engine import classify, save_result, simulate
+from custom_equations import compile_modules, module_parameters, module_ranges
 
 MAX_CONDITIONS = 2_000_000
 
@@ -92,12 +93,12 @@ def _random_draws(low, high, distribution, count, master_seed, group_index, axis
 
 def candidate_parameters(model_name, ranges, group, index, master_seed, group_index,
                          baseline_parameters=None, return_indices=False,
-                         composition=None):
+                         composition=None, custom_modules=None):
     spec = effective_model(model_name, composition)
-    base = dict(spec["parameters"])
+    base = {**spec["parameters"], **module_parameters(custom_modules)}
     if baseline_parameters is not None:
         if set(baseline_parameters) != set(base):
-            raise ValueError("Baseline parameter names must match the PDF model")
+            raise ValueError("Baseline parameter names must match the selected model")
         base.update(baseline_parameters)
     keys = group["parameters"]
     domains = {**ranges, **group.get("ranges", {})}
@@ -108,6 +109,8 @@ def candidate_parameters(model_name, ranges, group, index, master_seed, group_in
             values = _random_draws(lo, hi, distribution, point_count(group, key),
                                    master_seed, group_index, axis)
         else:
+            if group.get("basis", "edited") == "paper" and key not in spec["parameters"]:
+                raise ValueError("Custom parameters use edited sweep bounds")
             values = _grid(lo, hi, distribution, point_count(group, key),
                            group.get("basis", "edited"), base[key],
                            spec["bifurcation"], key in ("x", "y"))
@@ -117,16 +120,18 @@ def candidate_parameters(model_name, ranges, group, index, master_seed, group_in
 
 def _evaluate(task):
     (model_name, cell_role, parameters, fixed_values, group_name, index,
-     candidate_seed, chosen, output, retain, disabled, composition) = task
+     candidate_seed, chosen, output, retain, disabled, composition, custom_modules) = task
     row = {"model": model_name, "cell_role": cell_role,
-           "configuration": "composed" if composition is not None else "published",
+           "configuration": ("extended" if custom_modules else
+                             "composed" if composition is not None else "published"),
            "group": group_name, "index": index,
            "sampling_seed": candidate_seed,
            "choice_indices": ", ".join(f"{key}{number}" for key, number in chosen.items()),
            **parameters}
     try:
         result = simulate(model_name, parameters, fixed_overrides=fixed_values,
-                          disabled_channels=disabled, composition=composition)
+                          disabled_channels=disabled, composition=composition,
+                          custom_modules=custom_modules)
         result["cell_role"] = cell_role
         metric = classify(result)
         row.update(metric)
@@ -152,11 +157,18 @@ def _valid_group_name(name):
 def run_search(model_name, ranges, groups, output, workers=None, master_seed=None,
                retain=("SWO_candidate",), progress=None, stop=None,
                baseline_parameters=None, fixed_overrides=None, cell_role="E",
-               disabled_channels=(), composition=None):
+               disabled_channels=(), composition=None, custom_modules=None):
     spec = effective_model(model_name, composition)
+    extras = module_parameters(custom_modules)
+    extra_ranges = module_ranges(custom_modules)
+    # Compile before writing output so malformed expressions fail immediately.
+    state_names = ("Na_mM", "Ca_uM") if spec["family"] in ("FNAN", "COMPOSED") else (
+        ("Na_mM",) if spec["family"] == "NAN" else ("Ca_uM",))
+    compile_modules(custom_modules, spec["parameters"], spec["fixed"], state_names)
+    search_spec = {**spec, "ranges": {**spec["ranges"], **extra_ranges}}
     validate_assignment(cell_role, model_name)
     disabled = validate_disabled_channels(model_name, disabled_channels, composition)
-    validate_ranges(spec, ranges, [group["parameters"] for group in groups])
+    validate_ranges(search_spec, ranges, [group["parameters"] for group in groups])
     if len({_valid_group_name(group["name"]) for group in groups}) != len(groups):
         raise ValueError("Combination names must be unique")
     for group in groups:
@@ -164,7 +176,7 @@ def run_search(model_name, ranges, groups, output, workers=None, master_seed=Non
             raise ValueError("An off channel cannot be a search axis; enable it first")
         if not set(group.get("ranges", {})) <= set(group["parameters"]):
             raise ValueError("Combination bounds must match its parameter selection")
-        validate_ranges(spec, {**ranges, **group.get("ranges", {})}, [group["parameters"]])
+        validate_ranges(search_spec, {**ranges, **group.get("ranges", {})}, [group["parameters"]])
         if group["kind"] not in ("random", "sweep"):
             raise ValueError("Select random or sweep for each combination")
         if not all(1 <= point_count(group, key) <= 1000 for key in group["parameters"]):
@@ -173,8 +185,9 @@ def run_search(model_name, ranges, groups, output, workers=None, master_seed=Non
             raise ValueError(f"Each combination must contain 1–{MAX_CONDITIONS:,} conditions")
         if group["kind"] == "sweep" and group.get("basis", "paper") not in ("paper", "edited"):
             raise ValueError("Sweep basis must be paper or edited")
-        if composition is not None and group["kind"] == "sweep" and group.get("basis", "paper") != "edited":
-            raise ValueError("Composed models use edited sweep bounds; they have no published joint sweep")
+        if (composition is not None or set(group["parameters"]) & set(extras)) and (
+                group["kind"] == "sweep" and group.get("basis", "paper") != "edited"):
+            raise ValueError("Custom parameters and assemblies use edited sweep bounds")
     if sum(group_total(group) for group in groups) > MAX_CONDITIONS:
         raise ValueError(f"A search can contain at most {MAX_CONDITIONS:,} conditions")
     workers = default_workers() if workers is None else int(workers)
@@ -185,28 +198,32 @@ def run_search(model_name, ranges, groups, output, workers=None, master_seed=Non
         raise ValueError("Invalid sampling seed")
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
-    selected_baseline = dict(spec["parameters"] if baseline_parameters is None
+    selected_baseline = dict({**spec["parameters"], **extras} if baseline_parameters is None
                              else baseline_parameters)
     baseline = dict(selected_baseline)
     for key in disabled:
         baseline[key] = 0.0
     fixed = dict(spec["fixed"] if fixed_overrides is None else fixed_overrides)
-    if set(baseline) != set(spec["parameters"]):
-        raise ValueError("Baseline parameter names must match the PDF model")
+    if set(baseline) != set(spec["parameters"]) | set(extras):
+        raise ValueError("Baseline parameter names must match the selected model")
     if set(fixed) != set(spec["fixed"]):
         raise ValueError("Fixed parameter names must match the PDF model")
-    if any(not math.isfinite(value) or (key not in ("x", "y") and value < 0)
+    if any(not math.isfinite(value) or (key in spec["parameters"] and key not in ("x", "y") and value < 0)
            for key, value in baseline.items()):
-        raise ValueError("Baseline parameter values must be finite and nonnegative")
+        raise ValueError("Invalid baseline parameter value")
     for group in groups:
         if group["kind"] == "sweep" and group.get("basis", "paper") == "paper":
             for key in group["parameters"]:
+                if key in extras:
+                    raise ValueError("Custom parameters use edited sweep bounds: " + key)
                 if key not in ("x", "y") and baseline[key] == 0:
                     raise ValueError("A zero baseline needs an edited-range sweep: " + key)
     config = {
         "model": model_name, "source_equations": spec["equations"],
-        "configuration": "composed" if composition is not None else "published",
+        "configuration": ("extended" if custom_modules else
+                          "composed" if composition is not None else "published"),
         "composition": spec.get("composition"),
+        "custom_modules": custom_modules or [],
         "cell_role": cell_role,
         "cell_role_note": "The E/I role is a research assignment, not a cell-type-specific fit",
         "source_baseline": spec["baseline"], "source_search": spec["search"],
@@ -215,7 +232,7 @@ def run_search(model_name, ranges, groups, output, workers=None, master_seed=Non
         "selected_baseline_before_channel_switches": selected_baseline,
         "baseline_parameters": baseline,
         "disabled_channels": list(disabled),
-        "default_ranges": spec["ranges"], "ranges": ranges,
+        "default_ranges": search_spec["ranges"], "ranges": ranges,
         "combinations": groups, "master_seed": master_seed,
         "cpu_count_reported": cpu_count(), "workers_used": workers,
         "retained_labels": list(retain),
@@ -230,16 +247,17 @@ def run_search(model_name, ranges, groups, output, workers=None, master_seed=Non
             for i in range(group_total(group)):
                 params, chosen = candidate_parameters(model_name, ranges, group, i,
                                                        master_seed, gi, baseline, True,
-                                                       composition=composition)
+                                                       composition=composition,
+                                                       custom_modules=custom_modules)
                 # The draw is reconstructed by (master, group, index).
                 yield (model_name, cell_role, params, fixed, group["name"], i,
                        f"{master_seed}:{gi}:{i}", chosen, str(output), tuple(retain),
-                       disabled, spec.get("composition"))
+                       disabled, spec.get("composition"), custom_modules)
 
     tasks = iter(task_stream())
     rows = []
     columns = ["model", "cell_role", "configuration", "group", "index", "sampling_seed", "choice_indices",
-               *spec["parameters"],
+               *spec["parameters"], *extras,
                "label", "peak_hz", "spikes_per_s", "min_mV", "max_mV",
                "manual_review_required", "trace_path", "error"]
     context = mp.get_context("spawn")

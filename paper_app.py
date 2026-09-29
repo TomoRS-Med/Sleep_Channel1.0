@@ -16,8 +16,11 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
-from PIL import Image, ImageTk
+from PIL import ImageTk, Image
+import pypdfium2 as pdfium
 
+from custom_equations import compile_modules, module_parameters, module_ranges
+from equation_editor import ModuleEditor
 from paper_catalog import (CELL_ROLE_MODELS, CHANNEL_LABELS,
                            available_channels, channel_sources, compose_model,
                            effective_model, get_model, validate_assignment)
@@ -27,7 +30,7 @@ from paper_search import MAX_CONDITIONS, cpu_count, default_workers, group_total
 
 
 class ParameterDialog(tk.Toplevel):
-    def __init__(self, parent, key, value, domain, points=None):
+    def __init__(self, parent, key, value, domain, points=None, allow_negative=False):
         super().__init__(parent)
         self.key = key
         self.title(key + " settings")
@@ -36,6 +39,7 @@ class ParameterDialog(tk.Toplevel):
         self.resizable(False, False)
         self.result = None
         self.points = points
+        self.allow_negative = allow_negative
         outer = ttk.Frame(self, padding=18)
         outer.grid()
         self.variables = {
@@ -77,7 +81,7 @@ class ParameterDialog(tk.Toplevel):
                     or not low < high or dist not in ("log", "uniform", "neglog")
                     or dist == "log" and low <= 0
                     or dist == "neglog" and high >= 0
-                    or self.key not in ("x", "y") and value < 0
+                    or not self.allow_negative and self.key not in ("x", "y") and value < 0
                     or points is not None and not 1 <= points <= 1000):
                 raise ValueError("Check the value, bounds, distribution and draw / level count")
             self.result = value, low, high, dist, points
@@ -113,7 +117,9 @@ class PaperApp(tk.Tk):
         self.preview = None
         self.groups = []
         self.points = {}
+        self.all_points_var = tk.StringVar(value="100")
         self.composition = None
+        self.custom_modules = []
         self.disabled_channels = set()
         self.channel_vars = {}
         self.selected_keys = set()
@@ -143,6 +149,7 @@ class PaperApp(tk.Tk):
         self.params_tab = ttk.Frame(book, padding=12)
         self.channels_tab = ttk.Frame(book, padding=12)
         self.builder_tab = ttk.Frame(book, padding=12)
+        self.custom_tab = ttk.Frame(book, padding=12)
         self.search_tab = ttk.Frame(book, padding=12)
         self.results_tab = ttk.Frame(book, padding=12)
         self.formulas_tab = ttk.Frame(book, padding=12)
@@ -150,6 +157,7 @@ class PaperApp(tk.Tk):
         for tab, title in ((self.params_tab, "Values and bounds"),
                            (self.channels_tab, "Channels"),
                            (self.builder_tab, "Build model"),
+                           (self.custom_tab, "Custom equations"),
                            (self.search_tab, "Combinations and run"),
                            (self.results_tab, "Results and traces"),
                            (self.formulas_tab, "Equations"),
@@ -158,6 +166,7 @@ class PaperApp(tk.Tk):
         self._build_params()
         self._build_channels()
         self._build_builder()
+        self._build_custom()
         self._build_search()
         self._build_results()
         self._build_formulas()
@@ -252,6 +261,155 @@ class PaperApp(tk.Tk):
         ttk.Label(tab, textvariable=self.builder_status_var, foreground="#41536a").pack(
             anchor="w", pady=8)
 
+    def _build_custom(self):
+        tab = self.custom_tab
+        ttk.Label(tab, text="Add hand-written current equations to the selected cell model.",
+                  font=("Arial", 12, "bold")).pack(anchor="w", pady=(0, 8))
+        ttk.Label(tab, text="Each gate can be instantaneous or an ODE with its own initial value. "
+                  "New constants appear in Values and bounds and can join random or sweep searches. "
+                  "Existing published equations are preserved unless you turn their channels off.",
+                  wraplength=1000, foreground="#526070").pack(anchor="w", pady=(0, 12))
+        self.custom_list = tk.Listbox(tab, height=12, exportselection=False)
+        self.custom_list.pack(fill="both", expand=True)
+        self.custom_list.bind("<Double-1>", lambda event: self.edit_custom())
+        controls = ttk.Frame(tab)
+        controls.pack(fill="x", pady=10)
+        for label, action in (("New current", self.add_custom),
+                              ("Edit selected", self.edit_custom),
+                              ("Remove selected", self.remove_custom),
+                              ("Save modules…", self.save_custom),
+                              ("Load modules…", self.load_custom)):
+            ttk.Button(controls, text=label, command=action).pack(side="left", padx=(0, 8))
+        ttk.Label(tab, text="Current I is an intrinsic current density (µA/cm²): "
+                  "dV/dt receives -I/C. Optional Na and Ca rates are entered explicitly. "
+                  "These modules are experimental definitions authored by the user.",
+                  wraplength=1000, foreground="#526070").pack(anchor="w", pady=8)
+
+    def _custom_state_names(self):
+        family = effective_model(self.model_var.get(), self.composition)["family"]
+        if family in ("FNAN", "COMPOSED"):
+            return ("Na_mM", "Ca_uM")
+        return ("Na_mM",) if family == "NAN" else ("Ca_uM",)
+
+    def _validate_custom(self, modules):
+        spec = effective_model(self.model_var.get(), self.composition)
+        compile_modules(modules, spec["parameters"], spec["fixed"], self._custom_state_names())
+
+    def _set_custom(self, modules):
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("Running", "Finish the current calculation first.", parent=self)
+            return
+        self._validate_custom(modules)
+        old_values, old_ranges = self.parameters, self.ranges
+        spec = effective_model(self.model_var.get(), self.composition)
+        defaults = module_parameters(modules)
+        ranges = module_ranges(modules)
+        previous_defaults = module_parameters(self.custom_modules)
+        previous_ranges = module_ranges(self.custom_modules)
+        self.custom_modules = copy.deepcopy(modules)
+        self.parameters = {**{key: old_values[key] for key in spec["parameters"]},
+                           **{key: (old_values[key] if key in old_values and
+                                     previous_defaults.get(key) == value else value)
+                              for key, value in defaults.items()}}
+        self.ranges = {**{key: old_ranges[key] for key in spec["ranges"]},
+                       **{key: (old_ranges[key] if key in old_ranges and
+                                     previous_ranges.get(key) == value else value)
+                          for key, value in ranges.items()}}
+        self.points = {key: self.points.get(key, 100) for key in self.ranges}
+        self.groups = []
+        self.refresh_custom()
+        self.refresh_params()
+        self.refresh_groups()
+        self._refresh_equations()
+        self._refresh_sources(spec)
+        self.status_var.set(f"{len(modules)} custom current(s); queued searches reset")
+
+    def refresh_custom(self):
+        self.custom_list.delete(0, "end")
+        for module in self.custom_modules:
+            kinds = ", ".join(f'{v["name"]}:{v["kind"]}' for v in module.get("variables", []))
+            self.custom_list.insert("end", f'{module["name"]} | I = {module["current"]}'
+                                    f' | {kinds} | {len(module.get("parameters", []))} parameters')
+
+    def _edit_custom(self, index=None):
+        before = self.custom_modules[index] if index is not None else None
+        def validate(module):
+            proposed = copy.deepcopy(self.custom_modules)
+            if index is None:
+                proposed.append(module)
+            else:
+                proposed[index] = module
+            self._validate_custom(proposed)
+        dialog = ModuleEditor(self, before, validate)
+        self.wait_window(dialog)
+        if dialog.result is not None:
+            proposed = copy.deepcopy(self.custom_modules)
+            if index is None:
+                proposed.append(dialog.result)
+            else:
+                proposed[index] = dialog.result
+            self._set_custom(proposed)
+
+    def add_custom(self):
+        self._edit_custom()
+
+    def edit_custom(self):
+        selected = self.custom_list.curselection()
+        if selected:
+            self._edit_custom(selected[0])
+
+    def remove_custom(self):
+        selected = self.custom_list.curselection()
+        if selected:
+            proposed = copy.deepcopy(self.custom_modules)
+            proposed.pop(selected[0])
+            self._set_custom(proposed)
+
+    def save_custom(self):
+        if not self.custom_modules:
+            messagebox.showinfo("Modules", "Create a module first.", parent=self)
+            return
+        path = filedialog.asksaveasfilename(parent=self, defaultextension=".json",
+                  filetypes=[("JSON", "*.json")], initialfile="custom_currents.json")
+        if path:
+            modules = copy.deepcopy(self.custom_modules)
+            for module in modules:
+                for param in module["parameters"]:
+                    key = param["name"]
+                    param["value"] = self.parameters[key]
+                    param["low"], param["high"], param["distribution"], param["unit"] = self.ranges[key]
+            Path(path).write_text(json.dumps({"format": "ChannelCircuitLab.custom.v1",
+                  "base_model": self.model_var.get(), "modules": modules}, indent=2)+"\n",
+                  encoding="utf-8")
+
+    def load_custom(self):
+        path = filedialog.askopenfilename(parent=self, filetypes=[("JSON", "*.json")])
+        if path:
+            try:
+                payload = json.loads(Path(path).read_text(encoding="utf-8"))
+                if payload.get("format") != "ChannelCircuitLab.custom.v1":
+                    raise ValueError("Unsupported custom module file")
+                self._set_custom(payload["modules"])
+            except (ValueError, TypeError, KeyError, OSError) as exc:
+                messagebox.showerror("Load modules", str(exc), parent=self)
+
+    def _refresh_equations(self):
+        base = equations_for(self.model_var.get(), self.disabled_channels, self.composition)
+        if self.custom_modules:
+            base += "\n\nUSER-DEFINED EXPERIMENTAL CURRENTS\n"
+            for module in self.custom_modules:
+                base += f'\n{module["name"]}\nI = {module["current"]}\n'
+                for variable in module["variables"]:
+                    notation = (f'd{variable["name"]}/dt' if variable["kind"] == "ode"
+                                else variable["name"])
+                    base += f'{notation} = {variable["equation"]}'
+                    if variable["kind"] == "ode":
+                        base += f'  (initial: {variable["initial"]})'
+                    base += "\n"
+                base += f'dNa/dt += {module.get("na_rate", "0")}\n'
+                base += f'dCa/dt += {module.get("ca_rate", "0")}\n'
+        self._write_text(self.formulas_text, base)
+
     def _current_modules(self):
         if self.composition is not None:
             return dict(self.composition["channels"])
@@ -288,6 +446,8 @@ class PaperApp(tk.Tk):
         try:
             spec = compose_model(self.model_var.get(),
                                  {"channels": modules})
+            compile_modules(self.custom_modules, spec["parameters"], spec["fixed"],
+                            ("Na_mM", "Ca_uM"))
         except ValueError as exc:
             messagebox.showerror("Build model", str(exc), parent=self)
             self.refresh_builder()
@@ -300,11 +460,15 @@ class PaperApp(tk.Tk):
                                  origin(key, old_modules) == origin(key, modules)
                                  else value)
                            for key, value in spec["parameters"].items()}
+        self.parameters.update({key: old_parameters.get(key, value) for key, value in
+                                module_parameters(self.custom_modules).items()})
         self.ranges = {key: (old_ranges[key] if key in old_ranges and
                              origin(key, old_modules) == origin(key, modules)
                              else domain)
                        for key, domain in spec["ranges"].items()}
-        self.points = {key: old_points.get(key, 24) for key in self.ranges}
+        self.ranges.update({key: old_ranges.get(key, domain) for key, domain in
+                            module_ranges(self.custom_modules).items()})
+        self.points = {key: old_points.get(key, 100) for key in self.ranges}
         self.fixed_values = {key: self.fixed_values.get(key, value)
                              for key, value in spec["fixed"].items()}
         self.composition = spec["composition"]
@@ -317,8 +481,7 @@ class PaperApp(tk.Tk):
         self.refresh_params()
         self.refresh_fixed()
         self.refresh_groups()
-        self._write_text(self.formulas_text, equations_for(
-            self.model_var.get(), self.disabled_channels, self.composition))
+        self._refresh_equations()
         self._refresh_sources(spec)
         self.status_var.set(f"Custom model: {len(modules)} channels; searches reset")
 
@@ -367,9 +530,7 @@ class PaperApp(tk.Tk):
             self.search_params_tree.selection_remove(key)
         self.refresh_groups()
         self.refresh_params()
-        self._write_text(self.formulas_text, equations_for(self.model_var.get(),
-                                                           self.disabled_channels,
-                                                           self.composition))
+        self._refresh_equations()
         self.status_var.set(f"{key}: {'off (g=0)' if key in self.disabled_channels else 'on'}")
 
     def enable_all_channels(self):
@@ -379,8 +540,7 @@ class PaperApp(tk.Tk):
         for variable in self.channel_vars.values():
             variable.set(True)
         self.refresh_params()
-        self._write_text(self.formulas_text, equations_for(
-            self.model_var.get(), composition=self.composition))
+        self._refresh_equations()
         self.status_var.set("All channels on")
 
     def _build_search(self):
@@ -402,8 +562,11 @@ class PaperApp(tk.Tk):
         ttk.Button(tab, text="Edit selected parameter",
                    command=self.edit_search_parameter).grid(row=2, column=0, columnspan=2,
                                                              sticky="w", pady=6)
-        ttk.Label(tab, textvariable=self.search_preview_var,
-                  foreground="#41536a").grid(row=2, column=2, columnspan=2, sticky="e")
+        all_controls = ttk.Frame(tab)
+        all_controls.grid(row=2, column=2, columnspan=2, sticky="e")
+        ttk.Label(all_controls, text="All draws / levels").pack(side="left", padx=5)
+        ttk.Entry(all_controls, textvariable=self.all_points_var, width=7).pack(side="left", padx=5)
+        ttk.Button(all_controls, text="Apply to all", command=self.apply_all_points).pack(side="left")
         ttk.Label(tab, text="Search mode").grid(row=3, column=0, sticky="w", pady=8)
         kind_box = ttk.Combobox(tab, textvariable=self.kind_var, values=("random", "sweep"),
                                 state="readonly", width=17)
@@ -414,8 +577,8 @@ class PaperApp(tk.Tk):
                                              values=("edited", "paper"),
                                              state="readonly", width=13)
         self.sweep_basis_box.grid(row=3, column=3, sticky="w")
-        ttk.Label(tab, text="Random: 24 draws per parameter = 24 pairs. Sweep: 24 × 24 levels = 576 pairs. Paper bounds are for sweep.",
-                  foreground="#526070").grid(row=4, column=0, columnspan=4, sticky="w", pady=8)
+        ttk.Label(tab, textvariable=self.search_preview_var,
+                  foreground="#41536a").grid(row=4, column=0, columnspan=4, sticky="w", pady=8)
         ttk.Button(tab, text="Add selected parameters as a search", command=self.add_group).grid(
             row=5, column=0, columnspan=2, sticky="w", pady=(8, 8))
         self.groups_list = tk.Listbox(tab, width=100, height=5, exportselection=False)
@@ -489,20 +652,22 @@ class PaperApp(tk.Tk):
         self.loaded_model = self.model_var.get()
         spec = get_model(self.model_var.get())
         self.composition = None
+        self.custom_modules = []
         self.parameters = copy.deepcopy(spec["parameters"])
         self.fixed_values = copy.deepcopy(spec["fixed"])
         self.ranges = copy.deepcopy(spec["ranges"])
-        self.points = {key: 24 for key in self.ranges}
+        self.points = {key: 100 for key in self.ranges}
         self.disabled_channels = set()
         self.groups = []
         self.sweep_basis_box.configure(values=("edited", "paper"))
         self.sweep_basis_var.set("edited")
         self.refresh_builder()
+        self.refresh_custom()
         self.refresh_channels()
         self.refresh_params()
         self.refresh_groups()
         self.refresh_fixed()
-        self._write_text(self.formulas_text, equations_for(self.model_var.get()))
+        self._refresh_equations()
         self._refresh_sources(spec)
         self.status_var.set(f"{self.role_var.get()} / {self.model_var.get()} | CPUs: {self.cpus}")
 
@@ -518,7 +683,9 @@ class PaperApp(tk.Tk):
             + "\n\nRanges and sampling: " + spec["search"] + "\n\n"
             + "The I role is a research assignment, not a cell-type-specific fit. "
             + "Single cells are simulated; automatic SWO labels require visual review.\n\n"
-            + note)
+            + note + ("\n\nUser-authored experimental currents: " +
+                      ", ".join(module["name"] for module in self.custom_modules)
+                      if self.custom_modules else ""))
 
     def on_role_selected(self, event=None):
         if self.worker and self.worker.is_alive():
@@ -546,14 +713,17 @@ class PaperApp(tk.Tk):
 
     def refresh_params(self):
         self.params_tree.delete(*self.params_tree.get_children())
-        original = effective_model(self.model_var.get(), self.composition)["ranges"]
+        original = {**effective_model(self.model_var.get(), self.composition)["ranges"],
+                    **module_ranges(self.custom_modules)}
         channels = available_channels(self.model_var.get(), self.composition)
         for key, domain in self.ranges.items():
             self.params_tree.insert("", "end", iid=key, values=(
                 key, f"{self.parameters[key]:.9g}", f"{domain[0]:.9g}",
                 f"{domain[1]:.9g}", domain[2], domain[3],
-                "Edited" if domain != original[key] else "Default bounds",
-                "Off" if key in self.disabled_channels else "On" if key in channels else "—"))
+                "Edited" if domain != original[key] else
+                "Custom" if key in module_parameters(self.custom_modules) else "Default bounds",
+                "Off" if key in self.disabled_channels else "On" if key in channels else
+                "Custom" if key in module_parameters(self.custom_modules) else "—"))
         self.refresh_search_params()
 
     def refresh_search_params(self):
@@ -565,7 +735,7 @@ class PaperApp(tk.Tk):
                 key, f"{self.parameters[key]:.9g}", f"{low:.9g}",
                 f"{high:.9g}", dist, self.points[key], unit,
                 "Off" if key in self.disabled_channels else "On" if key in
-                channels else "—"))
+                channels else "Custom" if key in module_parameters(self.custom_modules) else "—"))
         self.search_params_tree.selection_set(tuple(selected & set(self.ranges)))
         self.refresh_search_preview()
 
@@ -585,13 +755,37 @@ class PaperApp(tk.Tk):
         else:
             self.search_preview_var.set(f"{levels[0]:,} paired random draws = {levels[0]:,} conditions")
 
+    def apply_all_points(self):
+        try:
+            count = int(self.all_points_var.get())
+            if not 1 <= count <= 1000:
+                raise ValueError("Enter a whole number from 1 to 1000")
+            new_groups = copy.deepcopy(self.groups)
+            for group in new_groups:
+                group["points"] = {key: count for key in group["parameters"]}
+                group["samples"] = (count if group["kind"] == "random"
+                                    else count ** len(group["parameters"]))
+                if group_total(group) > MAX_CONDITIONS:
+                    raise ValueError(f'{group["name"]} would exceed '
+                                     f'{MAX_CONDITIONS:,} conditions; choose fewer levels')
+            if sum(group_total(group) for group in new_groups) > MAX_CONDITIONS:
+                raise ValueError(f"Queued searches would exceed {MAX_CONDITIONS:,} conditions")
+        except ValueError as exc:
+            messagebox.showerror("Draws / levels", str(exc), parent=self)
+            return
+        self.points = {key: count for key in self.points}
+        self.groups = new_groups
+        self.refresh_params()
+        self.refresh_groups()
+        self.status_var.set(f"{count} draws / levels applied to all parameters and searches")
+
     def edit_search_parameter(self):
         selected = self.search_params_tree.selection()
         if not selected:
             return
         key = selected[0]
         dialog = ParameterDialog(self, key, self.parameters[key], self.ranges[key],
-                                 self.points[key])
+                                 self.points[key], key in module_parameters(self.custom_modules))
         self.wait_window(dialog)
         if dialog.result:
             value, low, high, dist, points = dialog.result
@@ -635,7 +829,8 @@ class PaperApp(tk.Tk):
         if not selected:
             return
         key = selected[0]
-        dialog = ParameterDialog(self, key, self.parameters[key], self.ranges[key])
+        dialog = ParameterDialog(self, key, self.parameters[key], self.ranges[key],
+                                 allow_negative=key in module_parameters(self.custom_modules))
         self.wait_window(dialog)
         if dialog.result:
             value, low, high, dist, _ = dialog.result
@@ -658,8 +853,10 @@ class PaperApp(tk.Tk):
             messagebox.showerror("Combination", "Turn on a channel before using it as a search axis.", parent=self)
             return
         basis = self.sweep_basis_var.get()
-        if kind == "sweep" and self.composition is not None and basis != "edited":
-            messagebox.showerror("Sweep", "Custom assemblies use edited bounds only.", parent=self)
+        if (kind == "sweep" and basis != "edited" and
+                (self.composition is not None or set(selected) &
+                 set(module_parameters(self.custom_modules)))):
+            messagebox.showerror("Sweep", "Custom parameters use edited bounds only.", parent=self)
             return
         if (kind == "sweep" and basis == "paper" and any(
                 key not in ("x", "y") and self.parameters[key] == 0 for key in selected)):
@@ -738,15 +935,18 @@ class PaperApp(tk.Tk):
                                                 copy.deepcopy(self.parameters),
                                                 copy.deepcopy(self.fixed_values),
                                                 tuple(sorted(self.disabled_channels)),
-                                                copy.deepcopy(self.composition), out))
+                                                copy.deepcopy(self.composition),
+                                                copy.deepcopy(self.custom_modules), out))
         except ValueError as exc:
             messagebox.showerror("Baseline trace", str(exc), parent=self)
 
-    def _baseline_worker(self, model, cell_role, values, fixed, disabled, composition, out):
+    def _baseline_worker(self, model, cell_role, values, fixed, disabled, composition,
+                         custom_modules, out):
         try:
             result = simulate(model, values, fixed_overrides=fixed, stop=self.cancel,
                               progress=lambda n, total: self.events.put(("wave_progress", (n, total))),
-                              disabled_channels=disabled, composition=composition)
+                              disabled_channels=disabled, composition=composition,
+                              custom_modules=custom_modules)
             result["cell_role"] = cell_role
             save_result(result, out)
             self.events.put(("done", (out, "Baseline completed")))
@@ -770,18 +970,20 @@ class PaperApp(tk.Tk):
                  copy.deepcopy(self.fixed_values), copy.deepcopy(self.ranges),
                  copy.deepcopy(self.groups), workers,
                  tuple(sorted(self.disabled_channels)),
-                 copy.deepcopy(self.composition), out))
+                 copy.deepcopy(self.composition),
+                 copy.deepcopy(self.custom_modules), out))
             self.progress_var.set(f"0 / {total:,}")
             self.book.select(self.results_tab)
         except ValueError as exc:
             messagebox.showerror("Search", str(exc), parent=self)
 
     def _search_worker(self, model, cell_role, values, fixed, ranges, groups,
-                       workers, disabled, composition, out):
+                       workers, disabled, composition, custom_modules, out):
         try:
             run_search(model, ranges, groups, out, workers=workers,
                 baseline_parameters=values, fixed_overrides=fixed, cell_role=cell_role,
                 disabled_channels=disabled, composition=composition,
+                custom_modules=custom_modules,
                 stop=self.cancel,
                 progress=lambda n, total, row: self.events.put(("progress", (n, total, row))))
             self.events.put(("done", (out, "Search stopped" if self.cancel.is_set() else "Search completed")))
@@ -817,7 +1019,7 @@ class PaperApp(tk.Tk):
                     self.start_button.configure(state="normal")
                     self.baseline_button.configure(state="normal")
                     self.stop_button.configure(state="disabled")
-                    self._display_image(payload/"trace.png")
+                    self._display_image(payload/"trace.pdf")
                     self.status_var.set("Selected trace displayed")
                 elif kind == "error":
                     self.start_button.configure(state="normal")
@@ -860,14 +1062,21 @@ class PaperApp(tk.Tk):
         else:
             self.visible_rows = []
             self.info_var.set(str(path))
-            self._display_image(self.last_output/"trace.png")
+            self._display_image(self.last_output/"trace.pdf")
 
     def _display_image(self, path):
         if not path.exists():
             self.image_label.configure(image="", text="No saved plot. Compute the selected trace to view it.")
             return
-        with Image.open(path) as source:
-            img = source.copy()
+        document = pdfium.PdfDocument(str(path))
+        try:
+            page = document[0]
+            try:
+                img = page.render(scale=1.6).to_pil().copy()
+            finally:
+                page.close()
+        finally:
+            document.close()
         img.thumbnail((700, 540), Image.Resampling.LANCZOS)
         self.preview = ImageTk.PhotoImage(img)
         self.image_label.configure(image=self.preview, text="")
@@ -878,7 +1087,7 @@ class PaperApp(tk.Tk):
             return
         row = self.visible_rows[int(selected[0])]
         if row.get("trace_path"):
-            self._display_image(self.last_output/row["trace_path"]/"trace.png")
+            self._display_image(self.last_output/row["trace_path"]/"trace.pdf")
         else:
             self.image_label.configure(image="", text="Click Compute selected trace to view it")
 
@@ -893,22 +1102,27 @@ class PaperApp(tk.Tk):
             model = row["model"]
             config = json.loads((self.last_output/"search_config.json").read_text(encoding="utf-8"))
             composition = config.get("composition")
-            names = effective_model(model, composition)["parameters"]
+            custom_modules = config.get("custom_modules", [])
+            names = {**effective_model(model, composition)["parameters"],
+                     **module_parameters(custom_modules)}
             values = {k: float(row[k]) for k in names}
             fixed = config["fixed_values"]
             disabled = tuple(config.get("disabled_channels", ()))
             cell_role = row.get("cell_role") or config.get("cell_role", "E")
             out = self.last_output/row["group"]/f'candidate_{int(row["index"]):06d}'
             self._begin(self._inspect_worker,
-                        (model, cell_role, values, fixed, disabled, composition, out))
+                        (model, cell_role, values, fixed, disabled, composition,
+                         custom_modules, out))
         except (ValueError, KeyError, OSError) as exc:
             messagebox.showerror("Trace", str(exc), parent=self)
 
-    def _inspect_worker(self, model, cell_role, values, fixed, disabled, composition, out):
+    def _inspect_worker(self, model, cell_role, values, fixed, disabled, composition,
+                        custom_modules, out):
         try:
             result = simulate(model, values, fixed_overrides=fixed, stop=self.cancel,
                               progress=lambda n, total: self.events.put(("wave_progress", (n, total))),
-                              disabled_channels=disabled, composition=composition)
+                              disabled_channels=disabled, composition=composition,
+                              custom_modules=custom_modules)
             result["cell_role"] = cell_role
             save_result(result, out)
             self.events.put(("inspect", out))

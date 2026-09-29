@@ -52,6 +52,7 @@ venv_dir=".venv-$native_arch"
 "${arch_runner[@]}" "$venv_dir/bin/python" -m PyInstaller --noconfirm --clean --onedir --windowed \
   --name ChannelCircuitPaperLab \
   --target-arch "$native_arch" \
+  --collect-all pypdfium2 \
   --osx-bundle-identifier org.channelcircuitlab.paper \
   paper_app.py
 
