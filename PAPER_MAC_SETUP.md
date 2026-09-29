@@ -4,6 +4,8 @@
 2. Double-click `Build Paper Search.command`. The first run installs dependencies, builds `dist/ChannelCircuitPaperLab.app`, and opens it.
 3. On later runs, double-click the `.app` in `dist`.
 
+After downloading an updated ZIP, extract it into a new folder and run its `Build Paper Search.command` again. An `.app` built from an older folder will still contain the older code.
+
 The builder selects a Python interpreter compatible with the Mac's CPU. If it reports that Python/Tkinter is unavailable, reopen Terminal after installation and run the `.command` again.
 
 Select E or I and a model at the top. Tatsuki AN is available for both roles. The Values and bounds tab edits representative values and constants. The Channels tab has an on/off switch for each conductance; switching one off applies g=0 to traces and searches. The Equations tab groups membrane, concentration, current and gate equations by channel and marks off currents.

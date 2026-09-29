@@ -371,6 +371,7 @@ def save_result(result, directory):
     import matplotlib
     matplotlib.use("Agg")
     from matplotlib import font_manager
+    from matplotlib.backends.backend_pdf import FigureCanvasPdf
     from matplotlib.figure import Figure
 
     # macOS includes Arial. Embed the chosen TrueType font in vector PDFs.
@@ -421,5 +422,7 @@ def save_result(result, directory):
                  + " | " + metric["label"]
                  + (" | OFF: " + ", ".join(off) if off else ""))
     fig.tight_layout()
-    fig.savefig(directory/"trace.pdf", format="pdf")
+    # Use the PDF canvas directly; dynamic backend lookup can omit this module
+    # from a PyInstaller bundle even when desktop Python can save PDFs.
+    FigureCanvasPdf(fig).print_pdf(directory/"trace.pdf")
     return metric

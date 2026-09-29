@@ -53,6 +53,7 @@ venv_dir=".venv-$native_arch"
   --name ChannelCircuitPaperLab \
   --target-arch "$native_arch" \
   --collect-all pypdfium2 \
+  --hidden-import matplotlib.backends.backend_pdf \
   --osx-bundle-identifier org.channelcircuitlab.paper \
   paper_app.py
 
