@@ -79,12 +79,13 @@ class ModuleEditor(tk.Toplevel):
             line.pack(fill="x", pady=3)
             ttk.Label(line, text=title, width=46).pack(side="left")
             ttk.Entry(line, textvariable=variable).pack(side="left", fill="x", expand=True)
-        ttk.Label(body, text="Variables: instant gives a value; ode gives d(variable)/dt and requires an initial value.",
+        ttk.Label(body, text="Variables: instant gives a value. ODE relaxation uses "
+                  "d(gate)/dt = (target - gate) / tau; direct derivative uses the entered d(gate)/dt.",
                   foreground="#526070").pack(anchor="w", pady=(10, 3))
         self.variables = ttk.Treeview(body, columns=("name", "kind", "equation", "initial"),
                                       show="headings", height=5, selectmode="browse")
-        for key, label, width in (("name", "Name", 110), ("kind", "Mode", 90),
-                                  ("equation", "Expression / derivative", 550),
+        for key, label, width in (("name", "Name", 110), ("kind", "Mode / ODE form", 155),
+                                  ("equation", "Evaluated equation", 515),
                                   ("initial", "Initial", 90)):
             self.variables.heading(key, text=label)
             self.variables.column(key, width=width)
@@ -121,17 +122,25 @@ class ModuleEditor(tk.Toplevel):
         self.variables.delete(*self.variables.get_children())
         self.parameters.delete(*self.parameters.get_children())
         for index, variable in enumerate(self.data["variables"]):
+            kind = variable["kind"]
+            form = variable.get("ode_form", "derivative") if kind == "ode" else ""
+            expression = variable["equation"]
+            if kind == "ode" and form == "relaxation":
+                expression = (f'({expression} - {variable["name"]}) / '
+                              f'({variable.get("tau", "?")})')
             self.variables.insert("", "end", iid=str(index), values=(
-                variable["name"], variable["kind"], variable["equation"],
-                variable.get("initial", "") if variable["kind"] == "ode" else "—"))
+                variable["name"], f"{kind} / {form}" if form else kind, expression,
+                variable.get("initial", "") if kind == "ode" else "—"))
         for index, parameter in enumerate(self.data["parameters"]):
             self.parameters.insert("", "end", iid=str(index), values=(
                 parameter["name"], parameter["value"], parameter["low"], parameter["high"],
                 parameter["distribution"], parameter.get("unit", "")))
 
     def _edit(self, target, fields, index=None):
-        dialog = FormDialog(self, "Edit " + target[:-1], fields,
-                            self.data[target][index] if index is not None else None)
+        initial = copy.deepcopy(self.data[target][index]) if index is not None else None
+        if target == "variables" and initial is not None and initial.get("kind") == "ode":
+            initial.setdefault("ode_form", "derivative")
+        dialog = FormDialog(self, "Edit " + target[:-1], fields, initial)
         self.wait_window(dialog)
         if dialog.result is not None:
             if index is None:
@@ -141,19 +150,23 @@ class ModuleEditor(tk.Toplevel):
             self.refresh()
 
     def add_variable(self):
-        self._edit("variables", (("name", "Name", "m", None),
-                                 ("kind", "Mode", "instant", ("instant", "ode")),
-                                 ("equation", "Value or derivative", "sigmoid(V/10)", None),
-                                 ("initial", "Initial value for ode", "0", None)))
+        self._edit("variables", self._variable_fields())
 
     def edit_variable(self):
         selected = self.variables.selection()
         if selected:
-            self._edit("variables", (("name", "Name", "m", None),
-                                     ("kind", "Mode", "instant", ("instant", "ode")),
-                                     ("equation", "Value or derivative", "0", None),
-                                     ("initial", "Initial value for ode", "0", None)),
-                       int(selected[0]))
+            self._edit("variables", self._variable_fields(), int(selected[0]))
+
+    @staticmethod
+    def _variable_fields():
+        return (("name", "Name", "h", None),
+                ("kind", "Mode", "ode", ("instant", "ode")),
+                ("ode_form", "ODE form (ignored for instant)", "relaxation",
+                 ("relaxation", "derivative")),
+                ("equation", "Instant value / target / full derivative",
+                 "sigmoid((V + 50) / 5)", None),
+                ("tau", "Time constant (ms; relaxation only)", "10", None),
+                ("initial", "Initial value (ODE only)", "0.5", None))
 
     def remove_variable(self):
         selected = self.variables.selection()

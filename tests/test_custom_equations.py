@@ -35,6 +35,42 @@ def channel(kind="instant"):
 
 
 class CustomEquationTests(unittest.TestCase):
+    def test_ode_relaxation_uses_target_and_time_constant(self):
+        spec = get_model("Sato 2025 NAN")
+        module = channel()
+        module["current"] = "gX * m^3 * h * (V - EX)"
+        module["variables"].append({
+            "name": "h", "kind": "ode", "ode_form": "relaxation",
+            "equation": "sigmoid((V + xx) / 40)", "tau": "tau_h", "initial": 0.2})
+        module["parameters"].extend([
+            {"name": "xx", "value": 0, "low": -20, "high": 20,
+             "distribution": "uniform", "unit": "mV"},
+            {"name": "tau_h", "value": 20, "low": 5, "high": 100,
+             "distribution": "log", "unit": "ms"},
+        ])
+        definitions = [module]
+        compiled = compile_modules(definitions, spec["parameters"], spec["fixed"], ("Na_mM",))
+        context = {**spec["parameters"], **spec["fixed"],
+                   **{p["name"]: p["value"] for p in module["parameters"]},
+                   "V": -40, "Na": 1, "t": 0}
+        derivative = compiled[0].evaluate([0.2], context)[3][0]
+        target = 1/(1+np.exp(1))
+        self.assertAlmostEqual(derivative, (target - .2) / 20)
+        context["tau_h"] = 0
+        with self.assertRaisesRegex(EquationError, "time constant must be positive"):
+            compiled[0].evaluate([0.2], context)
+        result = simulate("Sato 2025 NAN", record_ms=10, custom_modules=definitions)
+        h = result["states"][:, result["state_names"].index("ChannelX.h")]
+        self.assertTrue(np.isfinite(h).all())
+        self.assertGreaterEqual(h.min(), 0)
+        self.assertLessEqual(h.max(), 1)
+        legacy = {**module, "variables": [{"name": "h", "kind": "ode",
+                                            "equation": "sigmoid((V + xx) / 40)",
+                                            "initial": .2}], "current": "gX * h * (V - EX)"}
+        self.assertAlmostEqual(compile_modules([legacy], spec["parameters"], spec["fixed"],
+                                               ("Na_mM",))[0].evaluate([.2], context | {"tau_h": 20})
+                               [3][0], target)
+
     def test_instant_and_ode_gates_reference_existing_shift(self):
         for mode in ("instant", "ode"):
             module = channel(mode)

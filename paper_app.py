@@ -402,7 +402,11 @@ class PaperApp(tk.Tk):
                 for variable in module["variables"]:
                     notation = (f'd{variable["name"]}/dt' if variable["kind"] == "ode"
                                 else variable["name"])
-                    base += f'{notation} = {variable["equation"]}'
+                    expression = variable["equation"]
+                    if variable["kind"] == "ode" and variable.get("ode_form") == "relaxation":
+                        expression = (f'({expression} - {variable["name"]}) / '
+                                      f'({variable["tau"]})')
+                    base += f'{notation} = {expression}'
                     if variable["kind"] == "ode":
                         base += f'  (initial: {variable["initial"]})'
                     base += "\n"

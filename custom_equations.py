@@ -193,7 +193,25 @@ def compile_modules(modules, base_parameters, fixed, state_names):
                     raise EquationError(f"{name}.{key}: initial value must be finite")
                 state_keys.append(key)
                 initial.append(initial_value)
-                derivatives[key] = equation
+                # Absent ode_form is the original full-derivative JSON format.
+                # Its meaning is retained when loading previously saved modules.
+                ode_form = variable.get("ode_form", "derivative")
+                if ode_form == "relaxation":
+                    tau, _ = compile_expression(variable.get("tau"), allowed,
+                                                f"{name}.{key} time constant")
+
+                    def relaxation(context, target=equation, time_constant=tau,
+                                   state_name=key, label=f"{name}.{key}"):
+                        tau_ms = time_constant(context)
+                        if tau_ms <= 0:
+                            raise EquationError(f"{label}: time constant must be positive (ms)")
+                        return (target(context) - context[state_name]) / tau_ms
+
+                    derivatives[key] = relaxation
+                elif ode_form == "derivative":
+                    derivatives[key] = equation
+                else:
+                    raise EquationError(f"{name}.{key}: choose relaxation or derivative")
         ordered = []
         pending = dict(instant)
         while pending:
