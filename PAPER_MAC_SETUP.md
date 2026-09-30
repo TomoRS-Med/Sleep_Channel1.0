@@ -18,7 +18,7 @@ To run a joint search:
 
 1. Select any channel switches first. Switching off a channel removes searches that vary it. In Combinations and run, select multiple parameter rows. Use Command-click for nonadjacent rows.
 2. Double-click a row to edit its range, distribution and draw / sweep-level count. The default is 100 per parameter. To set them all at once, type a number in **All draws / levels** and click **Apply to all**.
-3. Choose **random** for 100 independent paired draws from the ranges (equal counts required), or **sweep** for the full Cartesian product of levels. Two parameters at 100 each make 100 random conditions or 10,000 sweep conditions. The app limits each search to 2,000,000 conditions. Sweeps containing a custom parameter use edited bounds.
+3. Choose **random** for 100 independent paired draws from the ranges (equal counts required), or **sweep** for the full Cartesian product of levels. Two parameters at 100 each make 100 random conditions or 10,000 sweep conditions. Draw counts and total conditions have no preset cap; check the displayed count before starting a large sweep. Sweeps containing a custom parameter use edited bounds.
 4. Add the search, choose worker processes and an output folder, then click Run search.
 
 The progress bar and count show completed conditions. Stop retains completed CSV rows. The results list shows candidate indices such as `gKNa2, tauNa3`; select a row to inspect its PDF plot or compute its trace. Plots are saved as `trace.pdf` with Arial text on macOS. All simulations run for 20 s; classification uses the final 10 s. Review every automatic SWO candidate visually.

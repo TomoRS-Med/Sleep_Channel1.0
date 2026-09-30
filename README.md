@@ -22,7 +22,7 @@ Use `*` for multiplication and parentheses for grouping; `^` means exponentiatio
 Each parameter starts with 100 draws / levels. Enter a number in **All draws / levels** and click **Apply to all** to update every parameter and queued group at once. Individual counts remain editable. For two parameters at 100 each, random computes 100 conditions and sweep computes 100 × 100 = 10,000 conditions. For four parameters:
 
 - **random**: independently draw 100 values from each parameter's range and pair them into 100 joint conditions, such as `(a2, b3, c12, d5)`. All selected parameters must have the same draw count. Log / neglog distributions draw uniformly in log magnitude; uniform distributions draw linearly.
-- **sweep**: evaluate the entire Cartesian product. Four axes at 100 levels each would require 100,000,000 conditions, above the app's 2,000,000-condition limit. Reduce the levels for large sweeps; the condition count appears before running.
+- **sweep**: evaluate the entire Cartesian product. Four axes at 100 levels each require 100,000,000 conditions. The condition count appears before running; large searches may take a long time and use substantial disk space.
 
 The app records one-based candidate indices, actual parameter values, disabled channels and an automatically generated sampling seed in the result CSV and JSON. An off channel cannot be selected as a search axis. It detects the Mac's logical CPUs and lets you choose the number of worker processes. The progress bar tracks simulated time for a single trace or completed joint conditions for a search.
 
